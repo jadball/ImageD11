@@ -237,8 +237,8 @@ class refinegrains:
         for i, g in enumerate(ul):
             # name = filename + "_" + str(i)
             # Hmmm .... multiple grain files?
-            name = i
-            self.grainnames.append(i)
+            name = int(g.name.strip("\n"))
+            self.grainnames.append(name)
             self.ubisread[name] = g.ubi
             self.translationsread[name] = g.translation
         #print "Grain names",self.grainnames
