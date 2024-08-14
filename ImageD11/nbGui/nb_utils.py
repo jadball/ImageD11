@@ -151,8 +151,8 @@ def prepare_mlem_bash(ds, grains, id11_code_path, n_simultaneous_jobs=50, cores_
 #SBATCH --cpus-per-task={cores_per_task}
 #
 date
-echo python3 {python_script_path} {id11_code_path} {grainsfile} $SLURM_ARRAY_TASK_ID {dsfile} {reconfile} {cores_per_task} > {log_path} 2>&1
-python3 {python_script_path} {id11_code_path} {grainsfile} $SLURM_ARRAY_TASK_ID {dsfile} {reconfile} {cores_per_task} > {log_path} 2>&1
+echo PYTHONPATH={id11_code_path} python3 {python_script_path} {grainsfile} $SLURM_ARRAY_TASK_ID {dsfile} {reconfile} {cores_per_task} > {log_path} 2>&1
+PYTHONPATH={id11_code_path} python3 {python_script_path} {grainsfile} $SLURM_ARRAY_TASK_ID {dsfile} {reconfile} {cores_per_task} > {log_path} 2>&1
 date
     """.format(outfile_path=outfile_path,
                errfile_path=errfile_path,
@@ -170,6 +170,106 @@ date
         bashscriptfile.writelines(bash_script_string)
 
     return bash_script_path, recons_path
+
+
+def prepare_astra_bash(ds, grainsfile, id11_code_path):
+    slurm_astra_path = os.path.join(ds.analysispath, "slurm_astra")
+
+    if not os.path.exists(slurm_astra_path):
+        os.mkdir(slurm_astra_path)
+
+    bash_script_path = os.path.join(slurm_astra_path, ds.dsname + '_astra_recon_slurm.sh')
+    python_script_path = os.path.join(id11_code_path, "ImageD11/nbGui/S3DXRD/run_astra_recon.py")
+    outfile_path = os.path.join(slurm_astra_path, ds.dsname + '_astra_recon_slurm_%A.out')
+    errfile_path = os.path.join(slurm_astra_path, ds.dsname + '_astra_recon_slurm_%A.err')
+    log_path = os.path.join(slurm_astra_path,
+                            ds.dsname + '_astra_recon_slurm_$SLURM_ARRAY_JOB_ID.log')
+
+    # python 2 version
+    bash_script_string = """#!/bin/bash
+#SBATCH --job-name=astra-recon
+#SBATCH --output={outfile_path}
+#SBATCH --error={errfile_path}
+#SBATCH --time=01:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+# define memory needs and number of tasks for each array job
+#SBATCH --ntasks=1
+#
+date
+module load cuda
+echo PYTHONPATH={id11_code_path} python3 {python_script_path} {grainsfile} {dsfile} > {log_path} 2>&1
+PYTHONPATH={id11_code_path} python3 {python_script_path} {grainsfile} {dsfile} > {log_path} 2>&1
+date
+    """.format(outfile_path=outfile_path,
+               errfile_path=errfile_path,
+               python_script_path=python_script_path,
+               id11_code_path=id11_code_path,
+               grainsfile=grainsfile,
+               dsfile=ds.dsfile,
+               log_path=log_path)
+
+    with open(bash_script_path, "w") as bashscriptfile:
+        bashscriptfile.writelines(bash_script_string)
+
+    return bash_script_path
+
+
+def prepare_pbp_bash(pbp_object, id11_code_path, minpkint):
+    ds = pbp_object.dset
+
+    slurm_pbp_path = os.path.join(ds.analysispath, "slurm_pbp")
+
+    if not os.path.exists(slurm_pbp_path):
+        os.mkdir(slurm_pbp_path)
+
+    bash_script_path = os.path.join(slurm_pbp_path, ds.dsname + '_pbp_recon_slurm.sh')
+    python_script_path = os.path.join(id11_code_path, "ImageD11/nbGui/S3DXRD/run_pbp_recon.py")
+    outfile_path = os.path.join(slurm_pbp_path, ds.dsname + '_pbp_recon_slurm_%A.out')
+    errfile_path = os.path.join(slurm_pbp_path, ds.dsname + '_pbp_recon_slurm_%A.err')
+    log_path = os.path.join(slurm_pbp_path,
+                            ds.dsname + '_pbp_recon_slurm_$SLURM_JOB_ID.log')
+
+    # python 2 version
+    bash_script_string = """#!/bin/bash
+#SBATCH --job-name=pbp_scanning
+#SBATCH --output={outfile_path}
+#SBATCH --error={errfile_path}
+#SBATCH --time=48:00:00
+#SBATCH --partition=nice-long
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=90
+
+#
+date
+source /cvmfs/hpc.esrf.fr/software/packages/linux/x86_64/jupyter-slurm/latest/envs/jupyter-slurm/bin/activate
+echo OMP_NUM_THREADS=1 PYTHONPATH={id11_code_path} python3 {python_script_path} {dsfile} {hkltol} {fpks} {dstol} {etacut} {ifrac} {costol} {y0} {symmetry} {foridx} {forgen} {uniqcut} {minpkint} > {log_path} 2>&1
+OMP_NUM_THREADS=1 PYTHONPATH={id11_code_path} python3 {python_script_path} {dsfile} {hkltol} {fpks} {dstol} {etacut} {ifrac} {costol} {y0} {symmetry} {foridx} {forgen} {uniqcut} {minpkint} > {log_path} 2>&1
+date
+        """.format(outfile_path=outfile_path,
+                   errfile_path=errfile_path,
+                   python_script_path=python_script_path,
+                   id11_code_path=id11_code_path,
+                   dsfile=ds.dsfile,
+                   hkltol=pbp_object.hkl_tol,
+                   fpks=pbp_object.fpks,
+                   dstol=pbp_object.ds_tol,
+                   etacut=pbp_object.etacut,
+                   ifrac=pbp_object.ifrac,
+                   costol=pbp_object.cosine_tol,
+                   y0=pbp_object.y0,
+                   symmetry=pbp_object.symmetry,
+                   foridx=str(pbp_object.foridx).replace(" ", ""),
+                   forgen=str(pbp_object.forgen).replace(" ", ""),
+                   uniqcut=pbp_object.uniqcut,
+                   minpkint=minpkint,
+                   log_path=log_path)
+
+    with open(bash_script_path, "w") as bashscriptfile:
+        bashscriptfile.writelines(bash_script_string)
+
+    return bash_script_path
+
 
 
 ## IO related stuff
@@ -283,29 +383,29 @@ def plot_index_results(ind, colfile, title):
 
     # set a mask of all non-assigned g-vectors
 
-    m = ind.ga == -1
-    # m = colfile.grain_id == -1
+    # m = ind.ga == -1
+    m = colfile.grain_id == -1
 
     # plot the assigned g-vectors omega vs dty (sinograms)
 
     axs_flat[1].scatter(colfile.omega[~m],
                         colfile.dty[~m],
-                        c=ind.ga[~m],
+                        c=colfile.grain_id[~m],
                         s=2,
                         cmap='tab20')
 
-    axs_flat[1].set(title='Sinograms of {} grains'.format(ind.ga.max() + 1),
+    axs_flat[1].set(title='Sinograms of {} grains'.format(colfile.grain_id.max() + 1),
                     xlabel='Omega/deg',
                     ylabel='dty/um')
 
     # Define weak peaks as all non-assigned peaks with intensity 1e-4 of max
-    cut = colfile.sum_intensity[m].max() * 1e-4
-    weak = colfile.sum_intensity[m] < cut
+    if m.sum() > 0:
+        cut = colfile.sum_intensity[m].max() * 1e-4
+        weak = colfile.sum_intensity[m] < cut
 
-    # Plot unassigned peaks in omega vs dty
-
-    axs_flat[2].scatter(colfile.omega[m][weak], colfile.dty[m][weak], s=2, label='weak')
-    axs_flat[2].scatter(colfile.omega[m][~weak], colfile.dty[m][~weak], s=2, label='not weak')
+        # Plot unassigned peaks in omega vs dty
+        axs_flat[2].scatter(colfile.omega[m][weak], colfile.dty[m][weak], s=2, label='weak')
+        axs_flat[2].scatter(colfile.omega[m][~weak], colfile.dty[m][~weak], s=2, label='not weak')
 
     axs_flat[2].set(title='Sinograms of unassigned peaks',
                     xlabel='Omega/deg',
@@ -321,9 +421,9 @@ def plot_index_results(ind, colfile, title):
                     yscale='log')
 
     # Plot d-star vs intensity for all unassigned peaks
-
-    axs_flat[4].scatter(colfile.ds[m][weak], colfile.sum_intensity[m][weak], s=2, label='weak')
-    axs_flat[4].scatter(colfile.ds[m][~weak], colfile.sum_intensity[m][~weak], s=2, label='not weak')
+    if m.sum() > 0:
+        axs_flat[4].scatter(colfile.ds[m][weak], colfile.sum_intensity[m][weak], s=2, label='weak')
+        axs_flat[4].scatter(colfile.ds[m][~weak], colfile.sum_intensity[m][~weak], s=2, label='not weak')
 
     axs_flat[4].set(title='Intensity of all unassigned peaks',
                     xlabel='d-star',
@@ -358,13 +458,20 @@ def plot_grain_sinograms(grains, cf, n_grains_to_plot=None):
     nrows = (len(grains[::grains_step]) + grid_size - 1) // grid_size
 
     fig, axs = plt.subplots(grid_size, nrows, figsize=(10, 10), layout="constrained", sharex=True, sharey=True)
-    for i, ax in enumerate(axs.ravel()):
-        if i < len(grains[::grains_step]):
-            # get corresponding grain for this axis
-            g = grains[::grains_step][i]
-            m = cf.grain_id == g.gid
-            ax.scatter(cf.omega[m], cf.dty[m], c=cf.sum_intensity[m], s=2)
-            ax.set_title(g.gid)
+    if grid_size == 1 & nrows == 1:
+        # only 1 grain
+        g = grains[0]
+        m = cf.grain_id == g.gid
+        axs.scatter(cf.omega[m], cf.dty[m], c=cf.sum_intensity[m], s=2)
+        axs.set_title(g.gid)
+    else:
+        for i, ax in enumerate(axs.ravel()):
+            if i < len(grains[::grains_step]):
+                # get corresponding grain for this axis
+                g = grains[::grains_step][i]
+                m = cf.grain_id == g.gid
+                ax.scatter(cf.omega[m], cf.dty[m], c=cf.sum_intensity[m], s=2)
+                ax.set_title(g.gid)
 
     fig.supxlabel("Omega")
     fig.supylabel("Y translation (um)")

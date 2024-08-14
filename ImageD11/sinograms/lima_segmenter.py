@@ -86,11 +86,6 @@ class SegmenterOptions:
             self.mask = 1 - fabio.open(self.maskfile).data.astype(np.uint8)
             assert self.mask.min() < 2
             assert self.mask.max() >= 0
-            print(
-                "# Opened mask",
-                self.maskfile,
-                " %.2f %% pixels are active" % (100 * self.mask.mean()),
-            )
         if len(self.bgfile):
             self.bg = fabio.open(self.bgfile).data
 
@@ -240,11 +235,12 @@ def clean(nnz, row, col, val):
     return sf
 
 
-def reader(frms, mask, cut):
+def reader(frms, mask, cut, start=0):
     """
     iterator to read chunks or frames and segment them
     returns sparseframes
     """
+    assert start < len(frms)
     if (
         (chunk2sparse is not None)
         and ("32008" in frms._filters)
@@ -253,14 +249,14 @@ def reader(frms, mask, cut):
     ):
         print("# reading compressed chunks")
         fun = chunk2sparse(mask, dtype=frms.dtype)
-        for i in range(frms.shape[0]):
+        for i in range(start, frms.shape[0]):
             filters, chunk = frms.id.read_direct_chunk((i, 0, 0))
             npx, row, col, val = fun.coo(chunk, cut)
             spf = clean(npx, row, col, val)
             yield spf
     else:
         fun = frmtosparse(mask, frms.dtype)
-        for i in range(frms.shape[0]):
+        for i in range(start, frms.shape[0]):
             frm = frms[i]
             if OPTIONS.bg is not None:
                 frm = frm.astype(np.float32) - OPTIONS.bg
@@ -399,9 +395,18 @@ def setup_slurm_array(dsname, dsgroup="/", pythonpath=None):
     sdir = os.path.join(dso.analysispath, "slurm")
     if not os.path.exists(sdir):
         os.makedirs(sdir)
+
+    sparsefilesdir = os.path.split(dstlima[0])[0]
+    if not os.path.exists(sparsefilesdir):
+        os.makedirs(sparsefilesdir)
+
     options = SegmenterOptions()
     options.load(dsname, dsgroup + "/lima_segmenter")
-
+    options.setup()
+    print("# Opened mask",
+          options.maskfile,
+          " %.2f %% pixels are active" % (100 * options.mask.mean()),
+        )
     files_per_job = options.files_per_core * options.cores_per_job
     jobs_needed = math.ceil(nfiles / files_per_job)
     sbat = os.path.join(sdir, "lima_segmenter_slurm.sh")

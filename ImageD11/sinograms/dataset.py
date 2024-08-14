@@ -74,18 +74,19 @@ class DataSet:
     )
     STRINGLISTS = ("scans", "imagefiles", "sparsefiles")
     # sinograms
-    NDNAMES = ("omega", "dty", "nnz", "frames_per_file", "nlm", "frames_per_scan")
+    NDNAMES = ("omega", "dty", "nnz", "frames_per_file", "nlm", "frames_per_scan", "monitor")
 
     def __init__(
-        self,
-        dataroot=".",
-        analysisroot=".",
-        sample="sample",
-        dset="dataset",
-        detector="eiger",
-        omegamotor="rot_center",
-        dtymotor="dty",
-        filename=None,
+            self,
+            dataroot=".",
+            analysisroot=".",
+            sample="sample",
+            dset="dataset",
+            detector="eiger",
+            omegamotor="rot_center",
+            dtymotor="dty",
+            filename=None,
+            analysispath=None
     ):
         """The things we need to know to process data"""
 
@@ -129,12 +130,17 @@ class DataSet:
         if filename is not None:
             self.load(filename)
         # paths for processed data
+
+        self.analysispath = analysispath
+
         self.update_paths()
 
-    def update_paths(self):
+    def update_paths(self, force=False):
         # paths for processed data
         # root of analysis for this dataset for this sample:
-        self.analysispath = os.path.join(self.analysisroot, self.sample, self.dsname)
+        self.analysispath_default = os.path.join(self.analysisroot, self.sample, self.dsname)
+        if self.analysispath is None:
+            self.analysispath = self.analysispath_default
 
         self.dsfile_default = os.path.join(
             self.analysispath, self.dsname + "_dataset.h5"
@@ -156,7 +162,7 @@ class DataSet:
             ("pbpfile", "_pbp.txt"),
         ]:
             # If the user has got a different name (via loading or edit), we keep that
-            if getattr(self, name, None) is None:
+            if (getattr(self, name, None) is None) or force:
                 # Otherwise, these are the defaults.
                 setattr(self, name, os.path.join(self.analysispath, self.dsname + extn))
 
@@ -259,9 +265,10 @@ class DataSet:
                     scan
                     for scan in list(hin["/"])
                     if (
-                        scan.endswith(".1")
-                        and ("measurement" in hin[scan])
-                        and (self.detector in hin[scan]["measurement"])
+                            scan.endswith(".1")
+                            and ("measurement" in hin[scan])
+                            and (self.detector in hin[scan]["measurement"])
+                            and (self.omegamotor in hin[scan]["measurement"])
                     )
                 ]
             goodscans = []
@@ -291,14 +298,13 @@ class DataSet:
     def import_imagefiles(self):
         """Get the Lima file names from the bliss master file, also scan_npoints"""
         # self.import_scans() should always be called before this function, so we know the detector
-        npts = None
         self.imagefiles = []
         self.frames_per_file = []
         with h5py.File(self.masterfile, "r") as hin:
             bad = []
             for i, scan in enumerate(self.scans):
                 if ("measurement" not in hin[scan]) or (
-                    self.detector not in hin[scan]["measurement"]
+                        self.detector not in hin[scan]["measurement"]
                 ):
                     print("Bad scan", scan)
                     bad.append(scan)
@@ -316,7 +322,8 @@ class DataSet:
                     assert self.limapath == vsrc.dset_name
         self.frames_per_file = np.array(self.frames_per_file, int)
         self.sparsefiles = [
-            name.replace("/", "_").replace(".h5", "_sparse.h5")
+            os.path.join('sparsefiles',
+                         name.replace("/", "_").replace(".h5", "_sparse.h5"))
             for name in self.imagefiles
         ]
         logging.info("imported %d lima filenames" % (np.sum(self.frames_per_file)))
@@ -329,11 +336,11 @@ class DataSet:
         """
         # self.guess_motornames()
         self.omega = [
-            None,
-        ] * len(self.scans)
+                         None,
+                     ] * len(self.scans)
         self.dty = [
-            None,
-        ] * len(self.scans)
+                       None,
+                   ] * len(self.scans)
         with h5py.File(self.masterfile, "r") as hin:
             bad = []
             for i, scan in enumerate(self.scans):
@@ -488,6 +495,25 @@ class DataSet:
                 ring_currents / np.max(ring_currents)
             )
 
+    def get_monitor(self, name='fpico6'):
+        # masterfile or sparsefile
+        hname = self.masterfile
+        if hasattr(self, 'sparsefile') and os.path.exists(self.sparsefile):
+            hname = self.sparsefile
+        monitor = []
+        with h5py.File( hname, 'r') as hin:
+            for scan in self.scans:
+                if scan.find('::')>-1:
+                    snum, slc = scan.split('::')
+                    lo, hi = [int(v) for v in slc[1:-1].split(':')]
+                    mon = hin[snum]['measurement'][name][lo:hi]
+                else:
+                    mon = hin[snum]['measurement'][name][:]
+                monitor.append(mon)
+        self.monitor = np.concatenate(monitor).reshape( self.shape )
+        return self.monitor
+
+
     def guess_detector(self):
         """Guess which detector we are using from the masterfile"""
 
@@ -603,8 +629,9 @@ class DataSet:
         cf = colfile_from_dict(spat(peaks_dict))
 
         # Update parameters for the columnfile
-        cf.parameters.loadparameters(self.parfile)
-        cf.updateGeometry()
+        if hasattr(self,'parfile') and self.parfile is not None:
+            cf.parameters.loadparameters(self.parfile)
+            cf.updateGeometry()
         return cf
 
     def get_cf_2d(self):
@@ -774,7 +801,7 @@ class DataSet:
                 if name in grp:
                     stringlist = list(grp[name][()])
                     if hasattr(stringlist[0], "decode") or isinstance(
-                        stringlist[0], np.ndarray
+                            stringlist[0], np.ndarray
                     ):
                         data = [s.decode() for s in stringlist]
                     else:
@@ -790,8 +817,8 @@ class DataSet:
         return self
 
 
-def load(h5name):
-    ds_obj = DataSet(filename = h5name)
+def load(h5name, h5group='/'):
+    ds_obj = DataSet(filename=h5name)
     return ds_obj
 
 
