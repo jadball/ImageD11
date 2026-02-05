@@ -24,6 +24,7 @@ import logging
 
 import fabio  # for LUT
 import numpy as np
+from numpy import radians, degrees
 
 from ImageD11 import cImageD11, gv_general
 
