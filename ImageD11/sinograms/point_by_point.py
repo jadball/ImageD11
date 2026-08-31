@@ -834,6 +834,7 @@ class PBP:
 #SBATCH --mem={mem_G}G
 export NUMBA_CACHE_DIR=/tmp/numba_${{SLURM_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}
 mkdir -p $NUMBA_CACHE_DIR
+trap 'rm -rf "$NUMBA_CACHE_DIR"' EXIT
 CHUNK_FILE={chunk_prefix}${{SLURM_ARRAY_TASK_ID}}{chunk_suffix}
 OMP_NUM_THREADS=1 PYTHONPATH={id11_code_path} python {python_script_path} \
 {config_path} $CHUNK_FILE {grains_prefix}${{SLURM_ARRAY_TASK_ID}}.txt
