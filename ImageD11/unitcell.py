@@ -555,7 +555,8 @@ class unitcell:
         # Cache if limit and tol are the same
         # this is called each time by assigntorings
         # slow if we are doing pbp indexing
-        if (getattr(self, "_rings_for", None) == (limit, tol)
+        key = (limit, tol)
+        if (getattr(self, "_rings_for", None) == key
                 and getattr(self, "ringds", None) is not None):
             return
         self.peaks = self.gethkls(limit + tol)  # [ ds, [hkl] ]
@@ -572,6 +573,11 @@ class unitcell:
                 self.ringds.append(peak[0])
                 self.ringhkls[self.ringds[-1]] = [peak[1]]
         self.ringtol = tol
+        # record what this was built for, so the next call can skip the
+        # rebuild. The cell is fixed by the constructor, so (limit, tol) is
+        # the whole of the state this depends on
+        self._rings_for = key
+  
 
     def ringtths(self, wavelength):
         """
