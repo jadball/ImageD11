@@ -687,7 +687,7 @@ class indexer:
         #         continue
         #     if abs(coses[-1] - a) > 1e-5:
         #         coses.append(a)
-        coses = self.unitcell.getcoses(self.ring_1, self.ring_2)
+        coses = self.unitcell.getcoses(self.ring_1, self.ring_2, tol=self.cosine_tol)  # was 1e-5 hardcoded before. with default cosine_tol, is now ~200x looser (more collapses)
         logging.info("Possible angles and cosines between peaks in rings:")
         for c in coses:
             logging.info("%.6f %.6f" % (math.acos(c) * 180 / math.pi, c))
