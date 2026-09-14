@@ -560,6 +560,10 @@ class unitcell:
                 and getattr(self, "ringds", None) is not None):
             return
         self.peaks = self.gethkls(limit + tol)  # [ ds, [hkl] ]
+        if len(self.peaks) == 0:
+            raise ValueError(
+                "No peaks found for limit=%s; try increasing limit" % (limit,)
+            )
         self.ringds = []  # a list of floats
         self.ringhkls = {}  # a dict of lists of integer hkl
         # Append first peak
@@ -573,11 +577,15 @@ class unitcell:
                 self.ringds.append(peak[0])
                 self.ringhkls[self.ringds[-1]] = [peak[1]]
         self.ringtol = tol
+<<<<<<< HEAD
         # record what this was built for, so the next call can skip the
         # rebuild. The cell is fixed by the constructor, so (limit, tol) is
         # the whole of the state this depends on
         self._rings_for = key
   
+=======
+        self._rings_for = (limit, tol)
+>>>>>>> f2a00e904c74bf7a1b0d5547bf56c5655df87557
 
     def ringtths(self, wavelength):
         """
