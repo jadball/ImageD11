@@ -244,3 +244,24 @@ class TestIndexCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def test_frm_binning_wraps_minus180_to_0_360_grid():
+    """A 360 scan stored as -180..180 against obincens on 0..360 (the
+    multi-turn branch of guessbins) must not pile negative omegas into bin 0."""
+    import types
+    from ImageD11.sinograms import voxel_mask as vm
+    ny, nom, step = 3, 721, 0.5
+    om_img = np.tile(-180 + np.arange(nom) * step, (ny, 1))
+    cens = np.arange(0, 360 + step * 0.1, step)
+    edges = np.arange(-step / 2, 360 + step / 1.9, step)
+    frm = np.arange(ny * nom)
+    mgr = types.SimpleNamespace(
+        icolf=types.SimpleNamespace(titles=["frm"], frm=frm.astype(float)),
+        dset=types.SimpleNamespace(omega=om_img, obincens=cens,
+                                   obinedges=edges))
+    omega = om_img.ravel()[frm]
+    iom, c, dev = vm._omega_bin_index_from_frm(mgr, omega, verbose=False)
+    assert dev < step
+    assert len(np.unique(iom)) >= nom - 1
+    iom2, c2 = vm._omega_bin_index(mgr, omega, verbose=False)
+    assert np.array_equal(iom, iom2)

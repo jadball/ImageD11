@@ -188,6 +188,28 @@ def load_peak_index_cache(filename, mmap=False, verbose=True):
 # 3. Heuristic
 # If you don't have either of the above, we can use a heuristic to bin omega based on the dty bins
 
+def wrap_into_edges(values, edges):
+    """Shift angles by multiples of 360 so they land inside [edges[0], edges[-1]].
+
+    Values already inside are untouched. Needed when peak/frame omega is
+    recorded on one convention (e.g. -180..180 or unwrapped multi-turn) and
+    the bin grid on another (e.g. 0..360). Values that cannot be brought
+    inside are left for the caller's clip.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    lo, hi = float(edges[0]), float(edges[-1])
+    out = (v < lo) | (v > hi)
+    if out.any():
+        v = v.copy()
+        v[out] = lo + np.mod(v[out] - lo, 360.0)
+    return v
+
+
+def angular_deviation(a, b):
+    """|a - b| in degrees, modulo 360, in [0, 180]."""
+    return np.abs(np.mod(np.asarray(a) - np.asarray(b) + 180.0, 360.0) - 180.0)
+
+
 def _omega_bin_index_from_frm(manager, omega, verbose=True):
     """Omega bin index via the per-peak frame number.
 
@@ -239,13 +261,11 @@ def _omega_bin_index_from_frm(manager, omega, verbose=True):
                   "falling back to omega binning" % om_img.size)
         return None
 
-    flat = om_img.ravel()
-    if edges[0] >= -1e-9 and flat.min() < -1e-9:
-        flat = flat % 360.0
+    flat = wrap_into_edges(om_img.ravel(), edges)
     iom_of_frame = np.digitize(flat, edges) - 1
     np.clip(iom_of_frame, 0, len(cens) - 1, out=iom_of_frame)
     iomega = iom_of_frame[frm]
-    dev = float(np.abs(omega - cens[iomega]).max())
+    dev = float(angular_deviation(omega, cens[iomega]).max())
 
     if verbose:
         live = int((np.bincount(iomega, minlength=len(cens)) > 0).sum())
@@ -311,11 +331,11 @@ def _omega_bin_index(manager, omega, omega_step=None, verbose=True):
  
     edges = np.asarray(edges, dtype=np.float64)
     cens = np.asarray(cens, dtype=np.float64)
-    om = omega % 360.0 if edges[0] >= -1e-9 and omega.min() < -1e-9 else omega
+    om = wrap_into_edges(omega, edges)
     iomega = np.digitize(om, edges) - 1
     np.clip(iomega, 0, len(cens) - 1, out=iomega)
     iomega = iomega.astype(np.int64)
-    dev = float(np.abs(omega - cens[iomega]).max())
+    dev = float(angular_deviation(omega, cens[iomega]).max())
     if verbose:
         live = int((np.bincount(iomega, minlength=len(cens)) > 0).sum())
         print("omega bins via obinedges (no frm): %d bins (%d with peaks), "

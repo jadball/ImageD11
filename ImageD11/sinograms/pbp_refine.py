@@ -162,6 +162,7 @@ from ImageD11.sinograms.sinogram import save_array
 from ImageD11.sinograms.tensor_map import unitcell_to_b
 from ImageD11.sinograms.voxel_mask import (
     VoxelSinoMasker,
+    angular_deviation,
     choose_omega_bins,
     fill_voxel_idx,
 )
@@ -709,7 +710,7 @@ def build_partition(refine, omega_binsize="auto", omega_step=None,
     if iom is None:                       # heuristic or explicit binsize
         iom = np.clip(np.round((omega - omega.min()) / M.omega_binsize
                                ).astype(np.int64), 0, nom - 1)
-    dev = float(np.abs(omega - ob[iom]).max())
+    dev = float(angular_deviation(omega, ob[iom]).max())
     ray_margin = 1.5 + rmax * np.radians(dev) / refine.ystep + 0.5
  
     if verbose:
