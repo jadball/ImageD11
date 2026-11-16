@@ -254,6 +254,78 @@ def do4dmerge(cf_2d_dict, n, omega, dty, ostep, ystep, radius=1.6):
     return cf_4d_dict
 
 
+def saddle_labels(smoothed, threshold, labels, wrk):
+    """
+    Labels peaks on the smoothed image by prominence (h-maxima, h = threshold).
+
+    localmaxlabel runs on the unthresholded image, so every local maximum,
+    including noise bumps on the glow around an intense spot, gets a label.
+    For each pair of touching labels the saddle is the highest value along
+    their boundary. Going down from the highest saddle, the label whose
+    maximum rises less than threshold above the saddle joins the other one.
+    Saddles at or below zero (the background level) cannot merge anything:
+    a maximum above threshold is always more than threshold above them.
+    Pixels below threshold get label 0. Returns the number of peaks; labels
+    are written in place, 1..npks.
+    """
+    n = ImageD11.cImageD11.localmaxlabel(smoothed, labels, wrk)
+    top = np.full(n + 1, -np.inf)
+    np.maximum.at(top, labels.ravel(), smoothed.ravel())
+    keys = []
+    saddles = []
+    for a, b, va, vb in (
+        (labels[:, :-1], labels[:, 1:], smoothed[:, :-1], smoothed[:, 1:]),
+        (labels[:-1, :], labels[1:, :], smoothed[:-1, :], smoothed[1:, :]),
+        (labels[:-1, :-1], labels[1:, 1:], smoothed[:-1, :-1], smoothed[1:, 1:]),
+        (labels[:-1, 1:], labels[1:, :-1], smoothed[:-1, 1:], smoothed[1:, :-1]),
+    ):
+        d = (a != b) & (a > 0) & (b > 0)
+        s = np.minimum(va[d], vb[d])
+        up = s > 0
+        lo = np.minimum(a[d], b[d])[up].astype(np.int64)
+        hi = np.maximum(a[d], b[d])[up].astype(np.int64)
+        keys.append(lo * (n + 1) + hi)
+        saddles.append(s[up])
+    keys = np.concatenate(keys)
+    saddles = np.concatenate(saddles)
+    o = np.lexsort((-saddles, keys))
+    keys = keys[o]
+    saddles = saddles[o]
+    first = np.ones(len(keys), bool)
+    first[1:] = keys[1:] != keys[:-1]  # highest saddle of each pair
+    keys = keys[first]
+    saddles = saddles[first]
+    o = np.argsort(-saddles, kind="stable")
+    parent = np.arange(n + 1)
+
+    def find(x):
+        r = x
+        while parent[r] != r:
+            r = parent[r]
+        while parent[x] != r:
+            parent[x], x = r, parent[x]
+        return r
+
+    for k, s in zip((keys[o]).tolist(), (saddles[o]).tolist()):
+        rx = find(k // (n + 1))
+        ry = find(k % (n + 1))
+        if rx == ry:
+            continue
+        if top[rx] < top[ry]:
+            rx, ry = ry, rx  # ry has the lower maximum
+        if top[ry] - s < threshold:
+            parent[ry] = rx
+    roots = np.array([find(i) for i in range(n + 1)])
+    roots[0] = 0
+    labels[:] = roots[labels]
+    labels[smoothed < threshold] = 0
+    used = np.unique(labels)
+    renum = np.zeros(n + 1, labels.dtype)
+    renum[used] = np.arange(len(used))
+    labels[:] = renum[labels]
+    return len(used) - 1
+
+
 class worker:
     """subtracts background, custom for ma4750"""
 
@@ -270,6 +342,8 @@ class worker:
         flatfile=None,
         darkfile=None,
         saturation=None,
+        prominence=False,
+        clipped=None,
     ):
         """
         bgfile = image containing the background
@@ -290,8 +364,18 @@ class worker:
         saturation = raw ADU (scalar or image) at or above which a pixel is
                      saturated. If given, peaksearch appends a column
                      (index NPROPERTY) counting saturated pixels per peak.
+        prominence = True: a local maximum is a peak of its own only if it
+                     rises at least threshold above the saddle joining it to
+                     a higher maximum; otherwise its pixels join that maximum.
+                     Without it, noise bumps on the glow of an intense spot
+                     are each labelled as a peak.
+        clipped = raw values below the saturation level that the detector
+                  writes only when clipping (e.g. Frelon bloom columns at
+                  43673 ADU). Pixels at these values count as saturated.
         """
         self.saturation = saturation
+        self.prominence = prominence
+        self.clipped = None if clipped is None or len(clipped) == 0 else np.asarray(clipped)
         self.flat = None
         self.dark = None
         self.bg = None
@@ -406,17 +490,33 @@ class worker:
         
         self.cor = self.bgsub(img, scale_factor=scale_factor)
         self.cor = self.masksub(self.cor)
+        lab_src = self.cor
+        if self.saturation is not None:
+            self.sat = img >= self.saturation
+            if self.clipped is not None:
+                self.sat |= np.isin(img, self.clipped)
+        if self.prominence and self.saturation is not None and self.sat.any():
+            # saturated values are not intensities (the pile-up level varies
+            # by column): label a saturated region as one flat plateau, which
+            # the prominence merge then joins into one peak
+            lab_src = self.cor.copy()
+            lab_src[self.sat] = self.cor[self.sat].max()
         # smooth the image for labelling (removes noise maxima)
-        self.smoothed = scipy.ndimage.gaussian_filter(self.cor, self.smoothsigma)
+        self.smoothed = scipy.ndimage.gaussian_filter(lab_src, self.smoothsigma)
         assert self.smoothed.dtype == np.float32
-        # zero out the background
-        self.mt = self.smoothed < self.threshold
-        self.smoothed[self.mt] = 0
-        # label on smoothed image
-        self.npks = ImageD11.cImageD11.localmaxlabel(
-            self.smoothed, self.labels, self.wrk
-        )
-        self.labels[self.mt] = 0
+        if self.prominence:
+            self.npks = saddle_labels(self.smoothed, self.threshold, self.labels, self.wrk)
+            self.mt = self.labels == 0
+            self.smoothed[self.mt] = 0
+        else:
+            # zero out the background
+            self.mt = self.smoothed < self.threshold
+            self.smoothed[self.mt] = 0
+            # label on smoothed image
+            self.npks = ImageD11.cImageD11.localmaxlabel(
+                self.smoothed, self.labels, self.wrk
+            )
+            self.labels[self.mt] = 0
         # now find the borders of each blob : first dilate
         l3 = scipy.ndimage.uniform_filter(self.labels * 7, 3)
         self.borders = (self.labels * 7) != l3
@@ -444,7 +544,7 @@ class worker:
         if self.saturation is not None:
             # saturated raw pixels per peak (label k is blob row k-1)
             n_sat = np.bincount(
-                self.labels[img >= self.saturation], minlength=self.npks + 1
+                self.labels[self.sat], minlength=self.npks + 1
             )[1:]
             self.blobs = np.column_stack((self.blobs, n_sat))
         self.goodpeaks = self.blobs[self.enoughpx]
