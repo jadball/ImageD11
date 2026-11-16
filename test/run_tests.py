@@ -14,6 +14,7 @@ modules = [
     "testlattice",
     "test_indexing",
     "test_localmaxlabel",
+    "test_frelon_saturation",
 #not a unittest    "test_overlapimage",
     "test_sparse_image",
     "test_omega_wraps",

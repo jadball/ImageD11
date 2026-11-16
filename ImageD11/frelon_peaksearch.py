@@ -75,6 +75,30 @@ def do3dmerge(cf_2d_dict, n, omega, radius=1.6):
             for destpk in destpks:
                 krow.append(srcpk + p[flo])
                 kcol.append(destpk + p[fhi])
+    if "n_sat" in cf_2d_dict:
+        # A bloomed saturated spot splits within a frame and its centroid
+        # moves by more than radius between frames: link saturated peaks
+        # whose bounding boxes touch, on the same frame or the previous one.
+        sat = cf_2d_dict["n_sat"] > 0
+        bb = [cf_2d_dict[k] for k in ("bb_mn_s", "bb_mx_s", "bb_mn_f", "bb_mx_f")]
+        for i in range(len(n)):
+            frames = [(order[i], order[i])]
+            if i > 0:
+                frames.append((order[i - 1], order[i]))
+            for flo, fhi in frames:
+                a = np.arange(p[flo], p[flo + 1])[sat[p[flo] : p[flo + 1]]]
+                b = np.arange(p[fhi], p[fhi + 1])[sat[p[fhi] : p[fhi + 1]]]
+                if len(a) == 0 or len(b) == 0:
+                    continue
+                touch = (
+                    (bb[0][a, None] <= bb[1][None, b] + 1)
+                    & (bb[1][a, None] + 1 >= bb[0][None, b])
+                    & (bb[2][a, None] <= bb[3][None, b] + 1)
+                    & (bb[3][a, None] + 1 >= bb[2][None, b])
+                )
+                ia, ib = np.nonzero(touch)
+                krow.extend(a[ia])
+                kcol.extend(b[ib])
         
     csr = scipy.sparse.csr_matrix(
         (np.ones(len(krow), dtype=bool), (kcol, krow)), shape=(len(o), len(o))
@@ -104,6 +128,14 @@ def do3dmerge(cf_2d_dict, n, omega, radius=1.6):
         "sum_intensity": s3dI,
         "Number_of_pixels": s3d1,
     }
+    if "n_sat" in cf_2d_dict:
+        cf_3d_dict["n_sat"] = np.bincount(
+            labels, minlength=ncomp, weights=cf_2d_dict["n_sat"]
+        )
+    if "sat_dist" in cf_2d_dict:
+        sat_dist = np.full(ncomp, np.inf)
+        np.minimum.at(sat_dist, labels, cf_2d_dict["sat_dist"])
+        cf_3d_dict["sat_dist"] = sat_dist
 
     cf_2d_dict["spot3d_id"] = labels
     return cf_3d_dict
@@ -213,6 +245,10 @@ def do4dmerge(cf_2d_dict, n, omega, dty, ostep, ystep, radius=1.6):
         "sum_intensity": s4dI,
         "Number_of_pixels": s4d1,
     }
+    if "n_sat" in cf_2d_dict:
+        cf_4d_dict["n_sat"] = np.bincount(
+            labels, minlength=ncomp, weights=cf_2d_dict["n_sat"]
+        )
 
     cf_2d_dict["spot4d_id"] = labels
     return cf_4d_dict
@@ -233,6 +269,7 @@ class worker:
         m_ratio_thresh=135,
         flatfile=None,
         darkfile=None,
+        saturation=None,
     ):
         """
         bgfile = image containing the background
@@ -247,7 +284,11 @@ class worker:
 
         flatfile = detector sensitivity image.
         darkfile = detector offset image
+        saturation = raw ADU (scalar or image) at or above which a pixel is
+                     saturated. If given, peaksearch appends a column
+                     (index NPROPERTY) counting saturated pixels per peak.
         """
+        self.saturation = saturation
         self.flat = None
         self.dark = None
         self.bg = None
@@ -383,6 +424,12 @@ class worker:
         )
         ImageD11.cImageD11.blob_moments(self.blobs)
         self.enoughpx = self.blobs[:, ImageD11.cImageD11.s_1] >= self.minpx
+        if self.saturation is not None:
+            # saturated raw pixels per peak (label k is blob row k-1)
+            n_sat = np.bincount(
+                self.labels[img >= self.saturation], minlength=self.npks + 1
+            )[1:]
+            self.blobs = np.column_stack((self.blobs, n_sat))
         self.goodpeaks = self.blobs[self.enoughpx]
         return self.goodpeaks
 
@@ -400,6 +447,8 @@ def get_dset(h5name, dsetname):
 def pps(arg):
     hname, dsetname, num, omega, worker_args, scale_factor = arg
     if pps.worker is None:
+        # one process per frame: more threads only oversubscribe the cores
+        ImageD11.cImageD11.cimaged11_omp_set_num_threads(1)
         pps.worker = worker(**worker_args)
     frm = get_dset(hname, dsetname)[num]
     pks = pps.worker.peaksearch(frm, omega=omega, scale_factor=scale_factor)
@@ -514,16 +563,36 @@ def peaks_list_to_dict(all_frames_peaks_list):
     """
     peaks_2d_dict = {title: [] for title in PKSAVE}
     num_peaks = []
+    n_sat = None
 
     for peak_index, properties in all_frames_peaks_list:
         for title, column_index in zip(PKSAVE, PKCOL):
             peaks_2d_dict[title].extend(properties[:, column_index])
+        if properties.shape[1] > ImageD11.cImageD11.NPROPERTY:  # worker saturation
+            if n_sat is None:
+                n_sat = []
+            n_sat.extend(properties[:, ImageD11.cImageD11.NPROPERTY])
 
         num_peaks.append(properties.shape[0])
+    if n_sat is not None:
+        peaks_2d_dict["n_sat"] = n_sat
     
     # Convert lists to numpy arrays
     for key in peaks_2d_dict:
         peaks_2d_dict[key] = np.array(peaks_2d_dict[key])
+
+    if n_sat is not None:
+        # distance (raw s/f pixels) to the nearest saturated peak on the same
+        # frame, inf if none: peaks in the glare halo of a saturated spot
+        sat_dist = np.full(len(peaks_2d_dict["s_raw"]), np.inf)
+        p = np.cumsum([0] + list(num_peaks))
+        for i in range(len(num_peaks)):
+            sat = peaks_2d_dict["n_sat"][p[i] : p[i + 1]] > 0
+            if sat.any():
+                sf = np.transpose((peaks_2d_dict["s_raw"][p[i] : p[i + 1]],
+                                   peaks_2d_dict["f_raw"][p[i] : p[i + 1]]))
+                sat_dist[p[i] : p[i + 1]] = scipy.spatial.cKDTree(sf[sat]).query(sf)[0]
+        peaks_2d_dict["sat_dist"] = sat_dist
     
     return peaks_2d_dict, num_peaks
 

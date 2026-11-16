@@ -174,6 +174,6 @@ class FrelonSegmenterGui:
 
     def getopts(self):
         opts = {name: self.options[name] for name in
-                ('bgfile', 'maskfile', 'flatfile', 'darkfile', 'threshold', 'smoothsigma', 'bgc', 'minpx', 'm_offset_thresh', 'm_ratio_thresh') if name in self.options.keys()}
+                ('bgfile', 'maskfile', 'flatfile', 'darkfile', 'threshold', 'smoothsigma', 'bgc', 'minpx', 'm_offset_thresh', 'm_ratio_thresh', 'saturation') if name in self.options.keys()}
         print("options = ", repr(opts))
         return opts
