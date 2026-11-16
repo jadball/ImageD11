@@ -281,6 +281,9 @@ class worker:
         minpx = minimum number of pixels in a peak
         m_offset_thresh = bgfile less than this is constant
         m_ratio_thresh  = bgfile greather than this is scaled?
+                          None: no scattered background to scale. bgfile is
+                          subtracted as it is and the offset of each frame is
+                          the median of the result over unmasked pixels.
 
         flatfile = detector sensitivity image.
         darkfile = detector offset image
@@ -325,7 +328,10 @@ class worker:
         self.bgc = bgc  # fractional part of bg per peak to remove
         self.minpx = minpx
 
-        if self.bg is not None:
+        if self.bg is not None and m_ratio_thresh is None:
+            self.m_ratio = None
+            self.m_active = None if self.mask is None else (self.mask == 0)
+        elif self.bg is not None:
             self.m_offset = self.bg < m_offset_thresh
             self.m_ratio = self.bg > m_ratio_thresh
             self.mbg = np.mean(self.bg[self.m_offset])
@@ -354,6 +360,17 @@ class worker:
 
         """
         img = self.correct(img)
+        if self.bg is not None and self.m_ratio is None:  # nothing to scale
+            np.subtract(img, self.bg, img)
+            if self.m_active is None:
+                self.offset = np.median(img)
+            else:
+                self.offset = np.median(img[self.m_active])
+            np.subtract(img, self.offset, img)
+            self.scale = 1
+            if scale_factor is not None:
+                img = img * scale_factor
+            return img
         if scale_factor is not None:
             img = img * scale_factor
         if self.bg is None:  # use image border

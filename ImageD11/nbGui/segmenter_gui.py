@@ -119,8 +119,11 @@ class FrelonSegmenterGui:
         minpx_slider = widgets.IntSlider(value=options["minpx"], min=0, max=50, step=1, description='minpx:')
         mofft_slider = widgets.IntSlider(value=options["m_offset_thresh"], min=0, max=200, step=1,
                                          description='m_offset_thresh:')
-        mratt_slider = widgets.IntSlider(value=options["m_ratio_thresh"], min=0, max=2000, step=1,
-                                         description='m_ratio_thresh:')
+        if options["m_ratio_thresh"] is None:  # no scattered background: nothing to tune
+            mratt_slider = widgets.fixed(None)
+        else:
+            mratt_slider = widgets.IntSlider(value=options["m_ratio_thresh"], min=0, max=2000, step=1,
+                                             description='m_ratio_thresh:')
         self.widget = widgets.interactive(self.update_image,
                                           threshold=thresh_slider,
                                           smoothsigma=smsig_slider,

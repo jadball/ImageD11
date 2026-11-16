@@ -66,6 +66,23 @@ class TestSaturation(unittest.TestCase):
         self.assertTrue((d3['sat_dist'][~weak] == 0).all())
 
 
+class TestNoScatter(unittest.TestCase):
+
+    def test_static_background_subtracted_unscaled(self):
+        # background = dark only (no scatter): per-pixel structure, frame offset drifts by 3 ADU
+        rs = np.random.RandomState(1)
+        bg = (94 + 20 * (np.arange(SHAPE[1]) >= 128)[None, :] + np.zeros(SHAPE)).astype(np.float32)
+        img = bg + 3 + rs.normal(0, 4, SHAPE).astype(np.float32)
+        img[100:104, 60:64] += 400
+        w = worker(bg.copy(), np.zeros(SHAPE, np.uint8), threshold=25, m_ratio_thresh=None)
+        cor = w.bgsub(img.copy())
+        self.assertAlmostEqual(w.offset, 3, delta=0.2)
+        self.assertLess(abs(np.median(cor)), 0.2)
+        self.assertAlmostEqual(cor[100:104, 60:64].mean(), 400, delta=5)
+        pks = w.peaksearch(img.copy())
+        self.assertEqual(len(pks), 1)
+
+
 class TestLocalmaxlabelThreads(unittest.TestCase):
 
     @unittest.skipIf(cid.cores_available() < 16,
