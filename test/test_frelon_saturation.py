@@ -43,24 +43,8 @@ class TestSaturation(unittest.TestCase):
         self.assertEqual(pks.shape[1], cid.NPROPERTY + 1)
         nsat = pks[:, cid.NPROPERTY]
         self.assertEqual(nsat.sum(), (img >= SAT).sum())
-        self.assertEqual((nsat > 0).sum(), 1)  # the two maxima of the bloom are one peak
+        self.assertEqual((nsat > 0).sum(), 2)  # the bloom is split in two
         self.assertEqual((nsat == 0).sum(), 1)  # the weak spot
-
-    def test_tail_bumps_merged(self):
-        # saturated core on a wide tail carrying two small bumps (glare structure)
-        img = np.full(SHAPE, 100, np.float32) + np.random.RandomState(7).normal(0, 2, SHAPE).astype(np.float32)
-        img[:10] = img[-10:] = img[:, :10] = img[:, -10:] = 10
-        yy, xx = np.mgrid[:SHAPE[0], :SHAPE[1]]
-        r2 = (yy - 128.) ** 2 + (xx - 128.) ** 2
-        img += 3000 * np.exp(-r2 / (2 * 15. ** 2))
-        for y, x in ((128, 163), (93, 128)):
-            img += 300 * np.exp(-((yy - y) ** 2 + (xx - x) ** 2) / (2 * 2. ** 2))
-        img[124:133, 124:133] = 60000
-        n_plain = len(make_worker(None).peaksearch(img.copy()))
-        pks = make_worker(SAT).peaksearch(img.copy())
-        self.assertGreater(n_plain, 1)
-        self.assertEqual(len(pks), 1)
-        self.assertEqual(pks[0, cid.NPROPERTY], 81)
 
     def merged(self, saturation):
         w = make_worker(saturation)

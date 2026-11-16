@@ -270,7 +270,6 @@ class worker:
         flatfile=None,
         darkfile=None,
         saturation=None,
-        merge_above=None,
     ):
         """
         bgfile = image containing the background
@@ -291,13 +290,8 @@ class worker:
         saturation = raw ADU (scalar or image) at or above which a pixel is
                      saturated. If given, peaksearch appends a column
                      (index NPROPERTY) counting saturated pixels per peak.
-        merge_above = raw ADU (scalar or image): a connected region above
-                      threshold holding a pixel at or above this becomes one
-                      peak (bright spots: tails cut into satellites).
-                      None: the saturation level, if given.
         """
         self.saturation = saturation
-        self.merge_above = saturation if merge_above is None else merge_above
         self.flat = None
         self.dark = None
         self.bg = None
@@ -405,29 +399,6 @@ class worker:
             img_masked[self.mask == 1] = 0
         return img_masked
 
-    def merge_bright(self, img):
-        """
-        The tails and blooms of a saturated or very bright spot are cut by
-        localmaxlabel into many local maxima (noise bumps on the slope).
-        Every label in a connected region above threshold that holds a
-        pixel >= merge_above becomes one peak. Labels are renumbered 1..npks.
-        """
-        sat = (img >= self.merge_above) & (self.labels > 0)
-        if not sat.any():
-            return
-        regions, nreg = scipy.ndimage.label(self.labels > 0, structure=np.ones((3, 3)))
-        inreg = np.isin(regions, np.unique(regions[sat]))
-        lab, reg = self.labels[inreg], regions[inreg]
-        first = np.full(nreg + 1, self.npks + 1, np.int64)
-        np.minimum.at(first, reg, lab)
-        lut = np.arange(self.npks + 1)
-        lut[lab] = first[reg]
-        used = np.unique(lut)
-        renum = np.zeros(self.npks + 1, self.labels.dtype)
-        renum[used] = np.arange(len(used))
-        self.labels[:] = renum[lut][self.labels]
-        self.npks = len(used) - 1
-
     def peaksearch(self, img, omega=0, scale_factor=None):
         if self.wrk is None:
             self.wrk = np.empty(img.shape, "b")
@@ -446,8 +417,6 @@ class worker:
             self.smoothed, self.labels, self.wrk
         )
         self.labels[self.mt] = 0
-        if self.merge_above is not None:
-            self.merge_bright(img)
         # now find the borders of each blob : first dilate
         l3 = scipy.ndimage.uniform_filter(self.labels * 7, 3)
         self.borders = (self.labels * 7) != l3
