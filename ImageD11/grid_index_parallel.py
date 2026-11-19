@@ -83,12 +83,32 @@ def domap(  pars,
     return gl
 
 
+def domap_robust( pars, colfile, grains, gridpars ):
+    """
+    domap, but a grain whose refinement fails (e.g. a left handed UBI from
+    a fit to too few peaks) is dropped instead of losing the whole batch
+    """
+    ss = sys.stdout
+    try:
+        return domap( pars, colfile, grains, gridpars )
+    except AssertionError:
+        sys.stdout = ss
+    kept = []
+    for g in grains:
+        try:
+            kept += domap( pars, colfile, [g], gridpars )
+        except AssertionError:
+            sys.stdout = ss
+    return kept
+
 
 def doindex( gve, x, y, z, w, gridpars):
     """
     Try to index some g-vectors
     """
-    NPKS = gridpars['NPKS']
+    # doindex counts on the indexing rings at TOLSEQ[0]; domap counts after
+    # refinement at TOLSEQ[-1]. NPKS_INDEX (optional) sets the first, NPKS both otherwise.
+    NPKS = gridpars.get('NPKS_INDEX', gridpars['NPKS'])
     UC =      gridpars['UC']
     TOLSEQ = gridpars['TOLSEQ']
     COSTOL = gridpars[ 'COSTOL']
@@ -135,6 +155,34 @@ def doindex( gve, x, y, z, w, gridpars):
         sys.stdout = ss
     return grains
 
+def gvectors_at( mytransformer, t, gridpars ):
+    """
+    Computes g-vectors for a grain at translation t = (t_x, t_y, t_z).
+    With gridpars['DSFILTER'] only peaks within DSTOL of a ring of
+    gridpars['UC'] are kept (peaks from grains elsewhere in a wide sample).
+    Returns (colfile, gve[3,n])
+    """
+    mytransformer.updateparameters( )
+    mytransformer.parameterobj.set_parameters(  {
+        't_x':t[0], 't_y':t[1], 't_z':t[2]
+    } )
+    mytransformer.compute_tth_eta( )
+    mytransformer.computegv( )
+    col = mytransformer.colfile
+    if gridpars.get('DSFILTER', False):
+        # computegv does not update the ds column: use |g|
+        dsnow = np.sqrt( col.gx * col.gx + col.gy * col.gy + col.gz * col.gz )
+        UC = gridpars['UC']
+        if len(getattr(UC, 'ringds', [])) == 0 or UC.ringds[-1] < dsnow.max():
+            UC.makerings( dsnow.max() + gridpars['DSTOL'] )
+        ringds = np.array( UC.ringds )
+        k = np.clip( np.searchsorted( ringds, dsnow ), 1, max(len(ringds) - 1, 1) )
+        near = np.minimum( abs( dsnow - ringds[k - 1] ), abs( dsnow - ringds[k] ) )
+        col = col.copyrows( near < gridpars['DSTOL'] )
+    gve = np.vstack(( col.gx, col.gy, col.gz ))
+    return col, gve
+
+
 def test_many_points( args ):
     """
     Grid index - loop over points
@@ -145,6 +193,8 @@ def test_many_points( args ):
     s += " %d to do"%(len(translations))
     s += "%s %s"%(colfile, parameters)
     print(s)
+    # set here: workers started from a fork server inherit its openmp threads
+    cImageD11.cimaged11_omp_set_num_threads( int( gridpars.get('NTHREAD', 1) ) )
     mytransformer = transformer.transformer()
     mytransformer.loadfiltered( colfile )
     mytransformer.loadfileparameters(  parameters )
@@ -152,23 +202,16 @@ def test_many_points( args ):
     first=True
     ni = len(translations)/100.0
     for i,(t_x, t_y, t_z) in enumerate(translations):
-        mytransformer.updateparameters( )
-        mytransformer.parameterobj.set_parameters(  {
-            't_x':t_x, 't_y':t_y, 't_z':t_z
-        } )
-        mytransformer.compute_tth_eta( )
-        mytransformer.computegv( )
-        #    mytransformer.savegv( tmp+".gve" )
-        gve = np.vstack(( mytransformer.colfile.gx,mytransformer.colfile.gy,mytransformer.colfile.gz ))
+        col, gve = gvectors_at( mytransformer, (t_x, t_y, t_z), gridpars )
         if first:
             first=False
         grains = doindex(gve, t_x,t_y,t_z, w, gridpars)
         ng = len(grains)
         if ng > 0:
-            grains = domap( mytransformer.parameterobj ,
-                            mytransformer.colfile ,
-                            grains,
-                            gridpars)
+            grains = domap_robust( mytransformer.parameterobj ,
+                                   col ,
+                                   grains,
+                                   gridpars)
             nk = len(grains)
             if len(grains) > 0:
                 test_many_points.q.put( grains, False ) # do not wait
@@ -286,6 +329,7 @@ def grid_index_parallel( fltfile, parfile, tmp, gridpars, translations ):
     """
     gridpars = initgrid( fltfile, parfile, tmp, gridpars )
     print( "Done init" )
+    nthreads_before = cImageD11.cimaged11_omp_get_max_threads()
     if 'NPROC' not in gridpars or gridpars['NPROC'] is None:
         NPR = max( cImageD11.cores_available() - 1, 1 )
         cImageD11.cimaged11_omp_set_num_threads(1)
@@ -325,10 +369,18 @@ def grid_index_parallel( fltfile, parfile, tmp, gridpars, translations ):
                 break
         except KeyboardInterrupt:
             break
+    # drain: a worker cannot exit until everything it put on the queue is read,
+    # so p.join() hangs if results are left behind
+    while True:
+        try:
+            ul.add( q.get(True, 1) )
+        except Queue.Empty:
+            break
     # write here to be on the safe side .... 
     grain.write_grain_file( gridpars['output_filename'], ul.uniqgrains )
     p.close()
     p.join()
+    cImageD11.cimaged11_omp_set_num_threads( nthreads_before )
 
 
 if __name__=="__main__":
@@ -354,6 +406,8 @@ if __name__=="__main__":
         'toldist' : 100.,
         'NPROC' : None, # guess from cpu_count
         'NTHREAD' : 2 ,
+        'DSFILTER' : False, # True: at each point, use only peaks on a ring for a grain there
+        # 'NPKS_INDEX' : 20, # optional: cut for indexing candidates, before refinement
         'output_filename' : None, # defaults to "all"+tmp+".map"
     }
             
