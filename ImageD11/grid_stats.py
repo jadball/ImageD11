@@ -130,16 +130,25 @@ def _match_job(args):
 
 
 def _null_job(args):
-    t, B, n, tolseq, tol, seed = args
+    t, B, n, tolseq, tol, seed, scramble = args
+    rng = np.random.RandomState(seed)
     gv = _G['geom'].gv(t, out=_G['gv'])
+    if scramble:   # each g turned about the rotation axis by a random angle
+        a = rng.uniform(0, 2 * np.pi, len(gv))
+        c, s = np.cos(a), np.sin(a)
+        gv[:, 0], gv[:, 1] = c * gv[:, 0] - s * gv[:, 1], s * gv[:, 0] + c * gv[:, 1]
     out = []
-    for U in random_rotations(n, np.random.RandomState(seed)):
+    for U in random_rotations(n, rng):
         u = np.linalg.inv(U.dot(B))
         for tl in tolseq:
             for _ in range(3):
                 cImageD11.score_and_refine(u, gv, tl)
         if np.linalg.det(u) > 0:
-            out.append(_assign(u, t, tol)[0])
+            d2, lab = _G['d2'], _G['lab']
+            d2[:] = 1
+            lab[:] = -1
+            cImageD11.score_and_assign(u, gv, tol, d2, lab, 0)
+            out.append(np.flatnonzero(lab == 0))
         else:
             out.append(np.zeros(0, int))
     return out
@@ -161,13 +170,17 @@ def match_grains(geom, grains, tol, nproc):
     return _pool_map(geom, _match_job, jobs, nproc)
 
 
-def null_matches(geom, translations, B, tolseq, tol, n_per_position, nproc, seed=0):
+def null_matches(geom, translations, B, tolseq, tol, n_per_position, nproc, seed=0,
+                 scramble=False):
     """
     Random orientations placed at the given translations (grain positions),
     refined against all peaks through tolseq like a candidate, then matched
     at hkl_tol tol. Returns a list of peak index arrays.
+    scramble : first turn each g-vector about the rotation axis by a random
+    angle (keeps |g| and g_z, so the detector coverage; no lattice left), so a
+    random orientation cannot refine onto a real grain that was not found.
     """
-    jobs = [(np.asarray(t, float), B, n_per_position, list(tolseq), tol, seed + i)
+    jobs = [(np.asarray(t, float), B, n_per_position, list(tolseq), tol, seed + i, scramble)
             for i, t in enumerate(translations)]
     res = _pool_map(geom, _null_job, jobs, nproc)
     return [m for r in res for m in r]
