@@ -15,6 +15,8 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
 - pair_peaks : mutual nearest partners in (omega, eta, 2theta, log I), scales
   from the pairs, cut where pairs stop outnumbering chance (partners searched
   at a wrong omega); pairs_within for another cut
+- partner_observable, partner_fraction : which peaks could have a partner
+  (detector, mask), and down to which intensity peaks pair more than chance
 - pair_colfile : the paired peaks with the pair g-vectors
 - ring_windows : ring centre, width and d* window from the paired peaks
 - index_pairs : the ImageD11 indexer, trial orientations strongest first,
@@ -26,6 +28,7 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
 from __future__ import print_function, division
 
 import numpy as np
+import scipy.ndimage
 import scipy.spatial
 from ImageD11 import cImageD11, transform, indexing
 
@@ -137,7 +140,8 @@ def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
 
     Returns a dict: i1, i2 (pairs: mutual nearest, within the cut), cut, scale,
     centre, and r, n_obs, n_null (the curves), d, j (nearest distance and
-    partner of every peak; pairs_within selects pairs at another cut).
+    partner of every peak; pairs_within selects pairs at another cut), d_null
+    (nearest chance distance per offset and peak), partner (predict_partners).
     """
     X = _space(cf)
     n = len(X)
@@ -156,14 +160,14 @@ def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
         scale = 1.4826 * np.median(np.abs(diff - centre), axis=0)
         d, j = _nearest(X, Q0 + centre, scale)
         d[~valid] = np.inf
-        dn = np.concatenate([_nearest(X, _space(cf, pred, o) + centre, scale)[0][valid]
-                             for o in null_offsets])
+        dn = np.array([_nearest(X, _space(cf, pred, o) + centre, scale)[0] for o in null_offsets])
+        dn[:, ~valid] = np.inf
         r = np.linspace(0, np.percentile(d[valid], 99), 500)
         n_obs = np.searchsorted(np.sort(d), r)
-        n_null = np.searchsorted(np.sort(dn), r) / len(null_offsets)
+        n_null = np.searchsorted(np.sort(dn.ravel()), r) / len(null_offsets)
         cut = r[np.argmax(n_obs - 2 * n_null)]
     P = {'cut': cut, 'scale': scale, 'centre': centre, 'r': r, 'n_obs': n_obs,
-         'n_null': n_null, 'd': d, 'j': j}
+         'n_null': n_null, 'd': d, 'j': j, 'd_null': dn, 'partner': pred}
     P['i1'], P['i2'] = pairs_within(P, cut)
     return P
 
@@ -175,6 +179,65 @@ def pairs_within(P, cut):
     i = np.arange(len(d))
     keep = (j[j] == i) & (d < cut) & (i < j)
     return i[keep], j[keep]
+
+
+def partner_observable(cf, P, mask=None, keep=0.95):
+    """
+    Whether each peak's partner could be seen: where -g diffracts
+    (P['partner'], for a grain at the origin) is on the detector, and no
+    masked pixel (mask: 1 = masked, raw pixels) is within the distance a real
+    partner lies from that prediction (the fraction keep of the pairs found).
+    Without a mask, the detector is taken as the area the peaks cover.
+    Returns a bool array and that distance in pixels.
+    """
+    pars = cf.parameters.parameters
+    om, eta, tth, valid = P['partner']
+    fc, sc = transform.compute_xyz_from_tth_eta(tth, eta, om, **pars)
+    # corrected -> raw pixels: the distortion at the nearest peak
+    tree = scipy.spatial.cKDTree(np.column_stack([cf.sc, cf.fc]))
+    _, k = tree.query(np.column_stack([sc, fc]))
+    s_raw = sc + (cf.s_raw - cf.sc)[k]
+    f_raw = fc + (cf.f_raw - cf.fc)[k]
+    i1, i2 = P['i1'], P['i2']
+    miss = np.concatenate([np.hypot(s_raw[i1] - cf.s_raw[i2], f_raw[i1] - cf.f_raw[i2]),
+                           np.hypot(s_raw[i2] - cf.s_raw[i1], f_raw[i2] - cf.f_raw[i1])])
+    margin = np.percentile(miss, 100 * keep)
+    if mask is None:
+        lo = np.array([cf.s_raw.min(), cf.f_raw.min()])
+        hi = np.array([cf.s_raw.max(), cf.f_raw.max()])
+        inside = ((s_raw - margin > lo[0]) & (s_raw + margin < hi[0]) &
+                  (f_raw - margin > lo[1]) & (f_raw + margin < hi[1]))
+        return valid & inside, margin
+    clear = scipy.ndimage.distance_transform_edt(np.asarray(mask) == 0)   # distance to a masked pixel
+    si, fi = np.round(s_raw).astype(int), np.round(f_raw).astype(int)
+    on = (si >= 0) & (si < clear.shape[0]) & (fi >= 0) & (fi < clear.shape[1]) & valid
+    ok = np.zeros(len(si), bool)
+    ok[on] = (clear[si[on], fi[on]] > margin) & \
+        (si[on] > margin) & (si[on] < clear.shape[0] - 1 - margin) & \
+        (fi[on] > margin) & (fi[on] < clear.shape[1] - 1 - margin)
+    return ok, margin
+
+
+def partner_fraction(P, logI, observable, nbins=40, cut=None):
+    """
+    Among peaks whose partner could be seen, in equal-count bins of log10
+    intensity: the fraction with a partner inside the cut and the fraction a
+    chance search finds (mean over the null offsets). The floor: going down
+    from the bin with the most real partners, the first intensity below which
+    a bin has no more real partners than chance ones (fraction <= 2 x chance).
+    Returns centres, edges, fraction, chance fraction, floor (log10 I).
+    """
+    cut = P['cut'] if cut is None else cut
+    x = logI[observable]
+    edges = np.unique(np.percentile(x, np.linspace(0, 100, nbins + 1)))
+    k = np.clip(np.searchsorted(edges, x, side='right') - 1, 0, len(edges) - 2)
+    n = np.bincount(k, minlength=len(edges) - 1).astype(float)
+    f = np.bincount(k, P['d'][observable] < cut, len(edges) - 1) / np.maximum(n, 1)
+    fn = np.mean([np.bincount(k, dn[observable] < cut, len(edges) - 1) for dn in P['d_null']], axis=0) / np.maximum(n, 1)
+    best = np.argmax(f - 2 * fn)
+    bad = np.flatnonzero(f[:best] <= 2 * fn[:best])
+    floor = edges[bad[-1] + 1] if len(bad) else edges[0]
+    return 0.5 * (edges[1:] + edges[:-1]), edges, f, fn, floor
 
 
 # ------------------------------------------------------------ pair g-vectors
