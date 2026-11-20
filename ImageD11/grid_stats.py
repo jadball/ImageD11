@@ -11,9 +11,11 @@ from __future__ import print_function, division
 
 import os
 import sys
+import shutil
+import tempfile
 import multiprocessing
 import numpy as np
-from ImageD11 import cImageD11, transform, transformer, unitcell, grain, simplex
+from ImageD11 import cImageD11, transform, transformer, unitcell, grain, simplex, columnfile
 from ImageD11.refinegrains import refinegrains
 from ImageD11.grid_index_parallel import gvectors_at, domap_robust
 
@@ -41,6 +43,17 @@ class PeakGeometry(object):
         self.args = (float(pars['omegasign']), float(pars['wavelength']),
                      float(pars['wedge']), float(pars['chi']))
         self.n = len(self.omega)
+
+    def arrays(self):
+        return {'xyz': self.xyz, 'omega': self.omega, 'args': np.array(self.args)}
+
+    @classmethod
+    def from_arrays(cls, a):
+        geom = cls.__new__(cls)
+        geom.xyz, geom.omega = a['xyz'], a['omega']
+        geom.args = tuple(float(x) for x in a['args'])
+        geom.n = len(geom.omega)
+        return geom
 
     def gv(self, t, out=None):
         """ g-vectors (n, 3) for a grain at translation t """
@@ -100,13 +113,38 @@ def grid_null_scores(fltfile, parfile, gridpars, points, n_per_point, nproc, see
             np.concatenate([r[1] for r in res]))
 
 
+# ------------------------------------------------------------ worker pools
+# With the forkserver start method (cImageD11.check_multiprocessing) each
+# worker imports ImageD11 and unpickles its arguments: 0.5 s per worker, one
+# after another. So the server preloads ImageD11 and the peak arrays go to the
+# workers through memory-mapped files instead of pickles.
+
+def _pool(nproc, initializer, initargs):
+    if multiprocessing.get_start_method(allow_none=True) == 'forkserver':
+        multiprocessing.set_forkserver_preload(['ImageD11.grid_stats'])   # if not started yet
+    return multiprocessing.Pool(nproc, initializer=initializer, initargs=initargs)
+
+
+def _save_arrays(arrays):
+    path = tempfile.mkdtemp(prefix='grid_stats_')
+    for name, a in arrays.items():
+        np.save(os.path.join(path, name + '.npy'), np.ascontiguousarray(a))
+    return path
+
+
+def _load_arrays(path):
+    return dict((f[:-4], np.load(os.path.join(path, f), mmap_mode='r'))
+                for f in os.listdir(path) if f.endswith('.npy'))
+
+
 # ------------------------------------------ scoring against all peaks (workers)
 
 _G = {}
 
 
-def _init_worker(geom):
+def _init_worker(path):
     cImageD11.cimaged11_omp_set_num_threads(1)
+    geom = PeakGeometry.from_arrays(_load_arrays(path))
     _G['geom'] = geom
     _G['gv'] = np.empty((geom.n, 3), float)
     _G['d2'] = np.empty(geom.n, float)
@@ -155,12 +193,14 @@ def _null_job(args):
 
 
 def _pool_map(geom, func, jobs, nproc):
-    p = multiprocessing.Pool(nproc, initializer=_init_worker, initargs=(geom,))
+    path = _save_arrays(geom.arrays())
+    p = _pool(nproc, _init_worker, (path,))
     try:
         return p.map(func, jobs, chunksize=max(1, len(jobs) // (4 * nproc)))
     finally:
         p.close()
         p.join()
+        shutil.rmtree(path)
 
 
 def match_grains(geom, grains, tol, nproc):
@@ -254,12 +294,13 @@ class _RefineDropFailed(refinegrains):
         self.tolerance = tolcache
 
 
-def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry):
+def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry, save_columns=True):
     """
     makemap.py in a function: refine the positions and UBIs of grains against
     the peaks in colfile at hkl tolerance tol. A grain whose fit fails is
     dropped and the rest are refined again (peak assignment depends on all
-    grains). colfile gets the makemap columns (labels, h, k, l, drlv2, ...).
+    grains). colfile gets the makemap columns (labels, drlv2, and with
+    save_columns h, k, l, gx, ...).
     Returns (refined grains, indices into grains of those kept).
     """
     # columns refinegrains.loadfiltered adds
@@ -290,7 +331,7 @@ def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry):
                 o.makeuniq(symmetry)
             o.generate_grains()
             o.refinepositions()
-            if not o.failed:
+            if not o.failed and save_columns:
                 o.savegrains(os.devnull, sort_npks=False)
         finally:
             sys.stdout.close()
@@ -302,15 +343,25 @@ def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry):
         kept = [i for i in kept if i not in failed]
 
 
-def _refine_init(args):
+# columns refinegrains writes (it makes its own when they are missing)
+_MAKEMAP_COLUMNS = ('labels', 'drlv2', 'tth_per_grain', 'eta_per_grain', 'omegacalc_per_grain',
+                    'Lorentz_per_grain', 'h', 'k', 'l', 'hr', 'kr', 'lr')
+
+
+def _refine_init(path, args):
     cImageD11.cimaged11_omp_set_num_threads(1)
-    _G['refine'] = args
+    a = _load_arrays(path)
+    colfile = columnfile.newcolumnfile([])
+    colfile.nrows = len(a[list(a)[0]])
+    for name in sorted(a):
+        colfile.addcolumn(a[name], name)
+    _G['refine'] = (colfile,) + args
 
 
 def _refine_job(ubis_translations):
-    parfile, colfile, tol, omega_slop, symmetry = _G['refine']
+    colfile, parfile, tol, omega_slop, symmetry = _G['refine']
     grains = [grain.grain(u, t) for u, t in ubis_translations]
-    out, kept = refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry)
+    out, kept = refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry, save_columns=False)
     return [(g.ubi, np.array(g.translation), g.npks, g.intensity_info) for g in out], kept
 
 
@@ -324,13 +375,14 @@ def refine_grains_parallel(parfile, colfile, grains, tol, omega_slop, symmetry, 
     chunk = max(1, len(grains) // (4 * nproc))
     starts = list(range(0, len(grains), chunk))
     jobs = [[(g.ubi, np.asarray(g.translation, float)) for g in grains[s:s + chunk]] for s in starts]
-    p = multiprocessing.Pool(nproc, initializer=_refine_init,
-                             initargs=((parfile, colfile, tol, omega_slop, symmetry),))
+    path = _save_arrays(dict((t, colfile[t]) for t in colfile.titles if t not in _MAKEMAP_COLUMNS))
+    p = _pool(nproc, _refine_init, (path, (os.path.abspath(parfile), tol, omega_slop, symmetry)))
     try:
         res = p.map(_refine_job, jobs, chunksize=1)
     finally:
         p.close()
         p.join()
+        shutil.rmtree(path)
     out, kept = [], []
     for s, (gl, k) in zip(starts, res):
         for (u, t, npks, info), i in zip(gl, k):
