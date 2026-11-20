@@ -14,7 +14,7 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
 - predict_partners : where -g of each peak diffracts (with wedge and chi)
 - pair_peaks : mutual nearest partners in (omega, eta, 2theta, log I), scales
   from the pairs, cut where pairs stop outnumbering chance (partners searched
-  at a wrong omega)
+  at a wrong omega); pairs_within for another cut
 - pair_colfile : the paired peaks with the pair g-vectors
 - ring_windows : ring centre, width and d* window from the paired peaks
 - index_pairs : the ImageD11 indexer, trial orientations strongest first,
@@ -136,7 +136,8 @@ def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
     adds more chance partners than real ones.
 
     Returns a dict: i1, i2 (pairs: mutual nearest, within the cut), cut, scale,
-    centre, and r, n_obs, n_null (the curves), d (all nearest distances).
+    centre, and r, n_obs, n_null (the curves), d, j (nearest distance and
+    partner of every peak; pairs_within selects pairs at another cut).
     """
     X = _space(cf)
     n = len(X)
@@ -161,10 +162,19 @@ def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
         n_obs = np.searchsorted(np.sort(d), r)
         n_null = np.searchsorted(np.sort(dn), r) / len(null_offsets)
         cut = r[np.argmax(n_obs - 2 * n_null)]
-    i = np.arange(n)
+    P = {'cut': cut, 'scale': scale, 'centre': centre, 'r': r, 'n_obs': n_obs,
+         'n_null': n_null, 'd': d, 'j': j}
+    P['i1'], P['i2'] = pairs_within(P, cut)
+    return P
+
+
+def pairs_within(P, cut):
+    """ pairs (i1, i2) of pair_peaks result P that are mutual nearest partners
+    closer than cut """
+    d, j = P['d'], P['j']
+    i = np.arange(len(d))
     keep = (j[j] == i) & (d < cut) & (i < j)
-    return {'i1': i[keep], 'i2': j[keep], 'cut': cut, 'scale': scale,
-            'centre': centre, 'r': r, 'n_obs': n_obs, 'n_null': n_null, 'd': d}
+    return i[keep], j[keep]
 
 
 # ------------------------------------------------------------ pair g-vectors
