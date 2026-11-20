@@ -12,9 +12,10 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
 - the pairs of one grain fix its t (least squares on g_s1 + g_s2).
 
 - predict_partners : where -g of each peak diffracts (with wedge and chi)
-- pair_peaks : mutual nearest partners in (omega, eta, 2theta, log I), scales
-  from the pairs, cut where pairs stop outnumbering chance (partners searched
-  at a wrong omega); pairs_within for another cut
+- pair_peaks : candidate partners near where -g diffracts, scored by how
+  much more often real pairs than chance ones (partners searched at a wrong
+  omega) have their omega mismatch, grain position and intensity; cut where
+  pairs stop outnumbering chance; pairs_within for another cut
 - partner_observable, partner_fraction : which peaks could have a partner
   (detector, mask), and down to which intensity peaks pair more than chance
 - pair_colfile : the paired peaks with the pair g-vectors
@@ -35,6 +36,8 @@ from ImageD11 import cImageD11, transform, indexing
 # (omega, eta, tth, log10 I); omega and eta are periodic
 _PERIODIC = np.array([True, True, False, False])
 NAMES = ('omega', 'eta', 'tth', 'logI')
+# per candidate pair (pair_peaks)
+FEATURES = ('rho', 'axis distance', 'height', 'dlogI')
 
 
 # ------------------------------------------------------------------ geometry
@@ -123,29 +126,12 @@ def _wrap(x):
     return x
 
 
-def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
-    """
-    Friedel pairs in a columnfile (omega, eta, tth, sum_intensity, sc, fc).
-
-    Each peak's partner is the nearest peak to where its -g diffracts
-    (predict_partners) with the same log I. Distances are in units of the
-    spread of each coordinate over the pairs (1.4826 MAD, centred on the
-    median offset), re-measured on the pairs inside the cut until it settles:
-    no weights to set.
-
-    Cut: partners are also searched null_offsets degrees away in omega (far
-    beyond the omega spread of real pairs), where only chance finds a peak.
-    The cut r maximises N(d < r) - 2 N_null(d < r): beyond it a wider window
-    adds more chance partners than real ones.
-
-    Returns a dict: i1, i2 (pairs: mutual nearest, within the cut), cut, scale,
-    centre, and r, n_obs, n_null (the curves), d, j (nearest distance and
-    partner of every peak; pairs_within selects pairs at another cut), d_null
-    (nearest chance distance per offset and peak), partner (predict_partners).
-    """
+def _nearest_pairs(cf, pred, null_offsets, niter):
+    """ mutual nearest partners in (omega, eta, tth, log I), distances in
+    spreads re-measured on the pairs, cut where N(d < r) - 2 N_null(d < r) is
+    largest (see pair_peaks) """
     X = _space(cf)
     n = len(X)
-    pred = predict_partners(cf)
     valid = pred[3]
     Q0 = _space(cf, pred)
     scale = np.array([1.0, 1.0, 1.0, 1e9])   # first pass: angles only
@@ -166,8 +152,156 @@ def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4):
         n_obs = np.searchsorted(np.sort(d), r)
         n_null = np.searchsorted(np.sort(dn.ravel()), r) / len(null_offsets)
         cut = r[np.argmax(n_obs - 2 * n_null)]
-    P = {'cut': cut, 'scale': scale, 'centre': centre, 'r': r, 'n_obs': n_obs,
-         'n_null': n_null, 'd': d, 'j': j, 'd_null': dn, 'partner': pred}
+    return scale, centre
+
+
+def _window(cf, pred, scale, centre, null_offsets):
+    """ angular search radius (spreads): where the nearest peak to the
+    predicted partner stops being more often real than chance, the r that
+    maximises N(d < r) - N_null(d < r) """
+    sc = scale.copy()
+    sc[3] = 1e9
+    X = _space(cf)
+    valid = pred[3]
+    d = _nearest(X, _space(cf, pred) + centre, sc)[0][valid]
+    dn = np.concatenate([_nearest(X, _space(cf, pred, o) + centre, sc)[0][valid] for o in null_offsets])
+    r = np.linspace(0, np.percentile(d, 99), 500)
+    gain = np.searchsorted(np.sort(d), r) - np.searchsorted(np.sort(dn), r) / len(null_offsets)
+    return r[np.argmax(gain)]
+
+
+def _candidates(cf, pred, scale, centre, window, domega):
+    """ all (peak, candidate partner) within window spreads in (omega, eta,
+    tth) of where each peak's partner is predicted, shifted by domega """
+    sc = scale[:3]
+    box = np.array([360 / sc[0], 360 / sc[1], 2 * np.ptp(cf.tth) / sc[2] + 1])
+    lo = np.array([0, 0, cf.tth.min() - np.ptp(cf.tth)])
+    X = np.mod((_space(cf)[:, :3] - lo) / sc, box)
+    Q = np.mod((_space(cf, pred, domega)[:, :3] + centre[:3] - lo) / sc, box)
+    vi = np.flatnonzero(pred[3])
+    lists = scipy.spatial.cKDTree(X, boxsize=box).query_ball_point(Q[vi], window)
+    a = np.repeat(vi, [len(l) for l in lists])
+    b = np.fromiter((k for l in lists for k in l), dtype=int, count=len(a))
+    return a, b
+
+
+def _pair_solve(x1, o1, x2, o2, pars, niter=6, h=100.0):
+    """ g_s1(t) + g_s2(t) = 0 per pair: Gauss-Newton for the t nearest the
+    origin along the two directions one pair fixes (h: finite difference step
+    in t). Returns t, g_s1(t), g_s2(t) and the unit vector of the direction t
+    cannot reach. """
+    t = np.zeros((len(x1), 3))
+    for _ in range(niter):
+        r = _pair_residual(x1, o1, x2, o2, t, pars)
+        J = np.empty((len(x1), 3, 3))
+        for k in range(3):
+            dt = np.zeros(3)
+            dt[k] = h
+            J[:, :, k] = (_pair_residual(x1, o1, x2, o2, t + dt, pars) -
+                          _pair_residual(x1, o1, x2, o2, t - dt, pars)) / (2 * h)
+        U, S, Vt = np.linalg.svd(J)
+        c = np.einsum('nji,nj->ni', U[:, :, :2], r) / S[:, :2]
+        t -= np.einsum('nij,ni->nj', Vt[:, :2, :], c)
+    return t, gv_rows(x1, o1, t, pars), gv_rows(x2, o2, t, pars), U[:, :, 2]
+
+
+def _pair_features(cf, xyz, a, b, domega, chunk=200000):
+    """ per candidate pair: rho, the part of g_s1 + g_s2 (over |g|) that no
+    grain position removes; the grain position nearest the axis, as distance
+    from the axis and height (um); difference of log10 intensity """
+    pars = cf.parameters.parameters
+    F = np.empty((len(a), 4))
+    logI = np.log10(np.maximum(cf.sum_intensity, 1.0))
+    for s in range(0, len(a), chunk):
+        i, j = a[s:s + chunk], b[s:s + chunk]
+        t, g1, g2, u = _pair_solve(xyz[i], cf.omega[i], xyz[j], cf.omega[j] - domega, pars)
+        gn = np.sqrt((((g1 - g2) / 2) ** 2).sum(axis=1))
+        F[s:s + chunk, 0] = ((g1 + g2) * u).sum(axis=1) / gn
+        F[s:s + chunk, 1] = np.hypot(t[:, 0], t[:, 1])
+        F[s:s + chunk, 2] = t[:, 2]
+        F[s:s + chunk, 3] = logI[j] - logI[i]
+    return F
+
+
+def _best(n, a, b, score):
+    """ highest scoring candidate of each peak: score (-inf if none), partner
+    (the peak itself if none) """
+    o = np.lexsort((-score, a))
+    first = np.r_[True, a[o][1:] != a[o][:-1]]
+    bs = np.full(n, -np.inf)
+    bj = np.arange(n)
+    bs[a[o][first]] = score[o][first]
+    bj[a[o][first]] = b[o][first]
+    return bs, bj
+
+
+def pair_peaks(cf, null_offsets=(7.1, -7.1, 13.3, -13.3), niter=4, nbins=60):
+    """
+    Friedel pairs in a columnfile (omega, eta, tth, sum_intensity, sc, fc).
+
+    1. Each peak's partner is predicted where its -g diffracts
+       (predict_partners). Mutual nearest partners in (omega, eta, 2theta,
+       log I) give the spread of each coordinate (1.4826 MAD about the median
+       offset). The search radius is where the nearest peak stops being more
+       often a real partner than a chance one.
+    2. Every peak within that radius is a candidate. For each candidate pair:
+       rho, the part of the pair equation g_s1(t) + g_s2(t) = 0 that no grain
+       position t removes (mostly the omega mismatch); the grain position
+       nearest the rotation axis (distance from the axis, height); the
+       difference in log I.
+    3. Chance candidates: the same search null_offsets degrees away in omega
+       (far beyond the omega spread of real pairs), moved back by the offset
+       so they are chance peaks at the predicted place.
+    4. Score: the sum over features of log(density of real / density of
+       chance), from histograms of the candidates (real = found minus chance)
+       in bins that each hold the same number of chance candidates. Each peak
+       keeps its best candidate. The cut maximises N - 2 N_null: beyond it a
+       lower score adds more chance partners than real ones.
+
+    Returns a dict: i1, i2 (pairs: mutual best, within the cut), cut, and
+    r, n_obs, n_null (the curves); d and j (minus the score of each peak's
+    best candidate, and that candidate: pairs_within selects pairs at another
+    cut), d_null (the same for chance, per offset); scale, centre (spreads and
+    median offset of step 1), window (search radius, spreads); features (name,
+    bin edges, candidate counts found and chance per bin, log ratio);
+    partner (predict_partners).
+    """
+    n = cf.nrows
+    pred = predict_partners(cf)
+    scale, centre = _nearest_pairs(cf, pred, null_offsets, niter)
+    window = _window(cf, pred, scale, centre, null_offsets)
+    xyz = lab_xyz(cf)
+    cand = []
+    for o in (0.0,) + tuple(null_offsets):
+        a, b = _candidates(cf, pred, scale, centre, window, o)
+        cand.append((a, b, _pair_features(cf, xyz, a, b, o)))
+    F0 = cand[0][2]
+    Fn = np.concatenate([c[2] for c in cand[1:]])
+    m = float(len(null_offsets))
+    lr = np.zeros(len(F0)), [np.zeros(len(c[0])) for c in cand[1:]]
+    features = []
+    for k, name in enumerate(FEATURES):
+        edges = np.unique(np.percentile(Fn[:, k], np.linspace(0, 100, nbins + 1)))
+        edges[0], edges[-1] = -np.inf, np.inf
+        h0 = np.histogram(F0[:, k], edges)[0].astype(float)
+        hn = np.histogram(Fn[:, k], edges)[0] / m
+        real = np.maximum(h0 - hn, 0) + 1
+        ratio = np.log((real / real.sum()) / ((hn + 1) / (hn + 1).sum()))
+        features.append((name, edges, h0, hn, ratio))
+        nb = len(ratio)
+        lr[0][:] += ratio[np.clip(np.searchsorted(edges, F0[:, k]) - 1, 0, nb - 1)]
+        for c, l in zip(cand[1:], lr[1]):
+            l += ratio[np.clip(np.searchsorted(edges, c[2][:, k]) - 1, 0, nb - 1)]
+    bs, j = _best(n, cand[0][0], cand[0][1], lr[0])
+    d = -bs
+    dn = np.array([-_best(n, c[0], c[1], l)[0] for c, l in zip(cand[1:], lr[1])])
+    fin = d[np.isfinite(d)]
+    r = np.linspace(fin.min(), np.percentile(fin, 99), 500)
+    n_obs = np.searchsorted(np.sort(d), r)
+    n_null = np.searchsorted(np.sort(dn.ravel()), r) / m
+    cut = r[np.argmax(n_obs - 2 * n_null)]
+    P = {'cut': cut, 'scale': scale, 'centre': centre, 'window': window, 'r': r, 'n_obs': n_obs,
+         'n_null': n_null, 'd': d, 'j': j, 'd_null': dn, 'partner': pred, 'features': features}
     P['i1'], P['i2'] = pairs_within(P, cut)
     return P
 
@@ -255,21 +389,7 @@ def pair_g(cf, i1, i2, niter=6, h=100.0):
     """
     pars = cf.parameters.parameters
     xyz = lab_xyz(cf)
-    x1, x2, o1, o2 = xyz[i1], xyz[i2], cf.omega[i1], cf.omega[i2]
-    t = np.zeros((len(i1), 3))
-    for _ in range(niter):
-        r = _pair_residual(x1, o1, x2, o2, t, pars)
-        J = np.empty((len(i1), 3, 3))
-        for k in range(3):
-            dt = np.zeros(3)
-            dt[k] = h
-            J[:, :, k] = (_pair_residual(x1, o1, x2, o2, t + dt, pars) -
-                          _pair_residual(x1, o1, x2, o2, t - dt, pars)) / (2 * h)
-        U, S, Vt = np.linalg.svd(J)
-        c = np.einsum('nji,nj->ni', U[:, :, :2], r) / S[:, :2]
-        t -= np.einsum('nij,ni->nj', Vt[:, :2, :], c)
-    g1 = gv_rows(x1, o1, t, pars)
-    g2 = gv_rows(x2, o2, t, pars)
+    _, g1, g2, _ = _pair_solve(xyz[i1], cf.omega[i1], xyz[i2], cf.omega[i2], pars, niter, h)
     g = (g1 - g2) / 2
     gn = np.sqrt((g * g).sum(axis=1))
     return g, np.sqrt(((g1 + g2) ** 2).sum(axis=1)) / gn
