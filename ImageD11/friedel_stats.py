@@ -20,9 +20,10 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
   (detector, mask), and down to which intensity peaks pair more than chance
 - pair_colfile : the paired peaks with the pair g-vectors
 - ring_windows : ring centre, width and d* window from the paired peaks
-- index_pairs : the ImageD11 indexer, trial orientations strongest first,
-  minpks from the same search on scrambled peaks (each g turned about the
-  rotation axis by a random angle)
+- LineIndexer : orientations from two pairs whose g-vectors make an allowed
+  angle and whose position lines cross; scored on the pairs that index and
+  pass through that position; minpks from scrambled peaks (each g turned
+  about the rotation axis by a random angle)
 - fit_positions : grain positions from their pairs
 """
 
@@ -31,7 +32,8 @@ from __future__ import print_function, division
 import numpy as np
 import scipy.ndimage
 import scipy.spatial
-from ImageD11 import cImageD11, transform, indexing
+from scipy.special import erfinv
+from ImageD11 import cImageD11, transform
 
 # (omega, eta, tth, log10 I); omega and eta are periodic
 _PERIODIC = np.array([True, True, False, False])
@@ -188,8 +190,9 @@ def _candidates(cf, pred, scale, centre, window, domega):
 def _pair_solve(x1, o1, x2, o2, pars, niter=6, h=100.0):
     """ g_s1(t) + g_s2(t) = 0 per pair: Gauss-Newton for the t nearest the
     origin along the two directions one pair fixes (h: finite difference step
-    in t). Returns t, g_s1(t), g_s2(t) and the unit vector of the direction t
-    cannot reach. """
+    in t). Returns t, g_s1(t), g_s2(t), the unit vector of the direction the
+    residual keeps whatever t, and the direction of the line of t that
+    satisfy the pair as well (t + s v). """
     t = np.zeros((len(x1), 3))
     for _ in range(niter):
         r = _pair_residual(x1, o1, x2, o2, t, pars)
@@ -202,7 +205,7 @@ def _pair_solve(x1, o1, x2, o2, pars, niter=6, h=100.0):
         U, S, Vt = np.linalg.svd(J)
         c = np.einsum('nji,nj->ni', U[:, :, :2], r) / S[:, :2]
         t -= np.einsum('nij,ni->nj', Vt[:, :2, :], c)
-    return t, gv_rows(x1, o1, t, pars), gv_rows(x2, o2, t, pars), U[:, :, 2]
+    return t, gv_rows(x1, o1, t, pars), gv_rows(x2, o2, t, pars), U[:, :, 2], Vt[:, 2, :]
 
 
 def _pair_features(cf, xyz, a, b, domega, chunk=200000):
@@ -214,7 +217,7 @@ def _pair_features(cf, xyz, a, b, domega, chunk=200000):
     logI = np.log10(np.maximum(cf.sum_intensity, 1.0))
     for s in range(0, len(a), chunk):
         i, j = a[s:s + chunk], b[s:s + chunk]
-        t, g1, g2, u = _pair_solve(xyz[i], cf.omega[i], xyz[j], cf.omega[j] - domega, pars)
+        t, g1, g2, u, _ = _pair_solve(xyz[i], cf.omega[i], xyz[j], cf.omega[j] - domega, pars)
         gn = np.sqrt((((g1 - g2) / 2) ** 2).sum(axis=1))
         F[s:s + chunk, 0] = ((g1 + g2) * u).sum(axis=1) / gn
         F[s:s + chunk, 1] = np.hypot(t[:, 0], t[:, 1])
@@ -389,7 +392,7 @@ def pair_g(cf, i1, i2, niter=6, h=100.0):
     """
     pars = cf.parameters.parameters
     xyz = lab_xyz(cf)
-    _, g1, g2, _ = _pair_solve(xyz[i1], cf.omega[i1], xyz[i2], cf.omega[i2], pars, niter, h)
+    _, g1, g2, _, _ = _pair_solve(xyz[i1], cf.omega[i1], xyz[i2], cf.omega[i2], pars, niter, h)
     g = (g1 - g2) / 2
     gn = np.sqrt((g * g).sum(axis=1))
     return g, np.sqrt(((g1 + g2) ** 2).sum(axis=1)) / gn
@@ -460,91 +463,185 @@ def ring_windows(ds, ringds, rings):
 
 # ---------------------------------------------------------------- indexing
 
-def _orient_scores(ind, hits, tol):
-    """ npks of the orientation made by each hit (i, j) on rings 1, 2 """
-    gv = ind.gvflat
-    out = np.zeros(len(hits), int)
-    for k, (_, i, j) in enumerate(hits):
-        ind.unitcell.orient(ind.ring_1, ind.gv[i], ind.ring_2, ind.gv[j], verbose=0)
-        out[k] = cImageD11.score(ind.unitcell.UBI, gv, tol)
-    return out
-
-
-def _scrambled(ind, rng):
-    """ a copy of the indexer with each g-vector turned about the rotation
-    axis by a random angle (same |g| and g_z, so the same rings and detector
-    coverage): no lattice left """
-    a = rng.uniform(0, 2 * np.pi, len(ind.gv))
-    c, s = np.cos(a), np.sin(a)
-    g = ind.gv
-    v = np.column_stack([c * g[:, 0] - s * g[:, 1], s * g[:, 0] + c * g[:, 1], g[:, 2]])
-    s = indexing.indexer(unitcell=ind.unitcell, gv=v, wavelength=ind.wavelength)
-    s.ds_tol = ind.ds_tol
-    s.cosine_tol = ind.cosine_tol
-    s.assigntorings()
-    return s
-
-
 def _ring_numbers(ringds, dstars):
     r = np.asarray(ringds)
     return [int(np.argmin(np.abs(r - d))) for d in dstars]
 
 
-def index_pairs(cfp, ucell, gen_ds, score_ds, dstol, hkl_tols, cosine_tol,
-                max_grains=1000, seed=0):
-    """
-    Index the pair g-vectors with the ImageD11 indexer.
+def pair_lines(cf, i1, i2):
+    """ The line of grain positions t that each pair (i1, i2) allows: the
+    point nearest the rotation axis and the unit direction. """
+    xyz = lab_xyz(cf)
+    t, _, _, _, v = _pair_solve(xyz[i1], cf.omega[i1], xyz[i2], cf.omega[i2], cf.parameters.parameters)
+    return t, v
 
-    gen_ds, score_ds : d* of the rings to make orientations from and to score
-    on (the indexer numbers its rings with tolerance dstol, so they are given
-    by d*, not by number).
-    For each hkl_tol and pair of rings in gen_ds, the trial orientations
-    (indexer.find) are scored and taken strongest first (indexer.scorethem,
-    which also rejects an orientation whose peaks are mostly taken).
-    minpks: the highest score of the same search on scrambled g-vectors
-    (each turned about the rotation axis by a random angle), so chance alone
-    is not expected to pass.
 
-    Returns the indexer (ubis, ga, colfile) and a list of (hkl_tol, ring_1,
-    ring_2, minpks, trials, new grains), rings numbered as in the indexer.
+def _turn_z(g, rng):
+    a = rng.uniform(0, 2 * np.pi, len(g))
+    c, s = np.cos(a), np.sin(a)
+    return np.column_stack([c * g[:, 0] - s * g[:, 1], s * g[:, 0] + c * g[:, 1], g[:, 2]])
+
+
+def _angle_matches(g, I1, I2, coses, tol, chunk=2000):
+    """ (i, j), i in I1, j in I2, whose angle matches one of coses within tol """
+    n = g / np.sqrt((g * g).sum(axis=1))[:, None]
+    A, B = [], []
+    for s in range(0, len(I1), chunk):
+        c = n[I1[s:s + chunk]].dot(n[I2].T)
+        m = np.zeros(c.shape, bool)
+        for x in coses:
+            m |= np.abs(c - x) < tol
+        i, j = np.nonzero(m)
+        A.append(I1[s:s + chunk][i])
+        B.append(I2[j])
+    return np.concatenate(A), np.concatenate(B)
+
+
+def _crossing(p1, v1, p2, v2):
+    """ closest approach of lines p + s v: distance, sine of the angle between
+    them and the midpoint """
+    w = p1 - p2
+    b = (v1 * v2).sum(axis=1)
+    d1, d2 = (v1 * w).sum(axis=1), (v2 * w).sum(axis=1)
+    den = np.maximum(1 - b * b, 1e-12)
+    s, u = (b * d2 - d1) / den, (d2 - b * d1) / den
+    q1, q2 = p1 + s[:, None] * v1, p2 + u[:, None] * v2
+    return np.sqrt(((q1 - q2) ** 2).sum(axis=1)), np.sqrt(den), 0.5 * (q1 + q2)
+
+
+def _half_normal_on(d, dn, w, niter=300):
+    """ d on [0, w) as (1 - f) half-normal(sigma) + f (density of dn): sigma """
+    d, dn = d[d < w], dn[dn < w]
+    edges = np.linspace(0, w, 81)
+    hb = np.histogram(dn, edges, density=True)[0]
+    bg = hb[np.clip(np.searchsorted(edges, d) - 1, 0, len(hb) - 1)]
+    s, f = w / 10.0, 0.5
+    for _ in range(niter):
+        g = (1 - f) * 2 * np.exp(-0.5 * (d / s) ** 2) / (s * np.sqrt(2 * np.pi))
+        p = g / (g + f * bg)
+        f = 1 - p.mean()
+        s = np.sqrt((p * d * d).sum() / p.sum())
+    return s
+
+
+class LineIndexer(object):
     """
-    ind = indexing.indexer_from_colfile_and_ucell(cfp, ucell=ucell)
-    ind.ds_tol = dstol
-    ind.assigntorings()
-    keep = np.isin(ind.ra, _ring_numbers(ind.unitcell.ringds, score_ds))
-    ind = indexing.indexer_from_colfile_and_ucell(cfp.copyrows(keep), ucell=ucell)
-    ind.ds_tol = dstol
-    ind.cosine_tol = cosine_tol
-    ind.max_grains = max_grains
-    ind.assigntorings()
-    rings_gen = _ring_numbers(ind.unitcell.ringds, gen_ds)
-    null = _scrambled(ind, np.random.RandomState(seed))
-    log = []
-    threads = cImageD11.cimaged11_omp_get_max_threads()
-    cImageD11.cimaged11_omp_set_num_threads(1)
-    try:
-        for tol in hkl_tols:
-            ind.hkl_tol = null.hkl_tol = tol
-            for a in range(len(rings_gen)):
-                for b in range(a, len(rings_gen)):
-                    for x in (ind, null):
-                        x.ring_1, x.ring_2 = rings_gen[a], rings_gen[b]
-                        x.find()
-                    nscore = _orient_scores(null, null.hits, tol)
-                    ind.minpks = int(nscore.max()) if len(nscore) else 0
-                    s = _orient_scores(ind, ind.hits, tol)
-                    order = np.argsort(s, kind='stable')
-                    ntrial = len(ind.hits)
-                    # scorethem pops from the end: strongest first
-                    ind.hits = [ind.hits[k] for k in order if s[k] > ind.minpks]
-                    nb4 = len(ind.ubis)
-                    if ind.hits:
-                        ind.scorethem()
-                    log.append((tol, rings_gen[a], rings_gen[b], ind.minpks, ntrial,
-                                len(ind.ubis) - nb4))
-    finally:
-        cImageD11.cimaged11_omp_set_num_threads(threads)
-    return ind, log
+    Index Friedel pairs using where their grains can be: each pair allows a
+    line of grain positions (pair_lines). Two pairs from one grain have
+    lines that cross at the grain.
+
+    For a pair of rings, every two pairs whose g-vectors make an allowed angle
+    (unitcell.getcoses, within cosine_tol) and whose lines pass within line_tol
+    give a trial: an orientation (unitcell.orient) and a grain position (where
+    the lines cross). A trial's score is the number of pairs that index
+    (within hkl_tol) and whose line also passes within line_tol of that
+    position. Trials are taken best first; each kept one claims its pairs.
+    minpks: the best score of as many trials made from scrambled g-vectors
+    (each turned about the rotation axis by a random angle; lines unchanged).
+
+    line_tol (measure_line_tol): the spread of the distance between the lines
+    of two pairs of one grain (half-normal on top of the scrambled distances),
+    and the distance that keeps the fraction keep of them. It can be set by
+    hand before run.
+    """
+
+    def __init__(self, cfp, t, v, ucell, score_ds, dstol, cosine_tol, keep=0.95, seed=0):
+        self.ucell = ucell
+        self.dstol = dstol
+        self.cosine_tol = cosine_tol
+        self.keep = keep
+        self.pair = cfp['pair'].astype(int)
+        self.t, self.v = t, v
+        g = np.column_stack([cfp.gx, cfp.gy, cfp.gz])
+        ringds = np.asarray(ucell.ringds)
+        self.ra = np.argmin(np.abs(cfp.ds[:, None] - ringds[None, :]), axis=1)
+        self.ra[np.abs(cfp.ds - ringds[self.ra]) >= dstol] = -1
+        self.S = np.flatnonzero(np.isin(self.ra, _ring_numbers(ringds, score_ds)))
+        self.g = {False: np.ascontiguousarray(g), True: np.ascontiguousarray(_turn_z(g, np.random.RandomState(seed)))}
+        self.gS = {k: np.ascontiguousarray(x[self.S]) for k, x in self.g.items()}
+        self.first = np.arange(len(g)) < len(g) // 2   # one row per pair (the other is -g)
+        self.claimed = np.zeros(len(t), bool)
+        self.rng = np.random.RandomState(seed)
+        self.line_tol = None
+        self.ubis, self.positions, self.npairs = [], [], []
+        self.pair_grain = np.full(len(t), -1)
+        self._drlv2 = np.empty(len(self.S))
+        self._lab = np.empty(len(self.S), np.int32)
+        r = np.sqrt((t[:, :2] ** 2).sum(axis=1))
+        self.radius = np.percentile(r, 100 * keep)
+
+    def _trials(self, r1, r2, scrambled):
+        coses = self.ucell.getcoses(r1, r2)
+        free = self.first & ~self.claimed[self.pair]
+        I1 = np.flatnonzero(free & (self.ra == r1))
+        I2 = np.flatnonzero(free & (self.ra == r2))
+        if len(coses) == 0 or len(I1) == 0 or len(I2) == 0:
+            return np.zeros(0, int), np.zeros(0, int), np.zeros(0), np.zeros(0), np.zeros((0, 3))
+        a, b = _angle_matches(self.g[scrambled], I1, I2, coses, self.cosine_tol)
+        k = self.pair[a] != self.pair[b]
+        a, b = a[k], b[k]
+        pa, pb = self.pair[a], self.pair[b]
+        d, sin, T = _crossing(self.t[pa], self.v[pa], self.t[pb], self.v[pb])
+        return a, b, d, sin, T
+
+    def measure_line_tol(self, ring_pairs):
+        """ line_tol from the trials of all ring_pairs ((r1, r2), ...);
+        returns the spread (sigma) and line_tol """
+        d = np.concatenate([self._trials(r1, r2, False)[2] for r1, r2 in ring_pairs])
+        dn = np.concatenate([self._trials(r1, r2, True)[2] for r1, r2 in ring_pairs])
+        w = 2 * self.radius
+        sigma = _half_normal_on(d, dn, w)
+        self.line_d, self.line_dn = d, dn
+        # half-normal: the fraction keep lies within sigma * sqrt(2) * erfinv(keep)
+        self.line_tol = sigma * np.sqrt(2) * erfinv(self.keep)
+        self.line_sigma = sigma
+        return sigma, self.line_tol
+
+    def _matched(self, scrambled, a, b, r1, r2, T, hkl_tol):
+        g = self.g[scrambled]
+        self.ucell.orient(r1, g[a], r2, g[b], verbose=0)
+        ubi = self.ucell.UBI.copy()
+        self._drlv2.fill(1.0)
+        self._lab.fill(-1)
+        cImageD11.score_and_assign(ubi, self.gS[scrambled], hkl_tol, self._drlv2, self._lab, 0)
+        p = np.unique(self.pair[self.S[self._lab == 0]])
+        p = p[~self.claimed[p]]
+        dp = self.t[p] - T
+        vv = self.v[p]
+        dist = np.sqrt(((dp - (dp * vv).sum(axis=1)[:, None] * vv) ** 2).sum(axis=1))
+        return ubi, p[dist < self.line_tol]
+
+    def _scores(self, scrambled, a, b, r1, r2, T, hkl_tol):
+        return np.array([len(self._matched(scrambled, a[k], b[k], r1, r2, T[k], hkl_tol)[1]) for k in range(len(a))], int)
+
+    def run(self, r1, r2, hkl_tol):
+        """ index on rings r1, r2; returns (minpks, trials, new grains) """
+        if self.line_tol is None:
+            self.measure_line_tol([(r1, r2)])
+        sin_min = self.line_tol / self.radius
+        a, b, d, sin, T = self._trials(r1, r2, False)
+        k = (d < self.line_tol) & (sin > sin_min)
+        a, b, T = a[k], b[k], T[k]
+        an, bn, dn, sinn, Tn = self._trials(r1, r2, True)
+        kn = np.flatnonzero((dn < self.line_tol) & (sinn > sin_min))
+        kn = self.rng.choice(kn, min(len(kn), len(a)), replace=False) if len(kn) else kn
+        sn = self._scores(True, an[kn], bn[kn], r1, r2, Tn[kn], hkl_tol)
+        minpks = int(sn.max()) if len(sn) else 0
+        s = self._scores(False, a, b, r1, r2, T, hkl_tol)
+        n0 = len(self.ubis)
+        for k in np.argsort(-s, kind='stable'):
+            if s[k] <= minpks:
+                break
+            if self.claimed[self.pair[a[k]]] or self.claimed[self.pair[b[k]]]:
+                continue
+            ubi, p = self._matched(False, a[k], b[k], r1, r2, T[k], hkl_tol)
+            if len(p) > minpks:
+                self.claimed[p] = True
+                self.pair_grain[p] = len(self.ubis)
+                self.ubis.append(ubi)
+                self.positions.append(T[k])
+                self.npairs.append(len(p))
+        return minpks, len(a), len(self.ubis) - n0
 
 
 # ---------------------------------------------------------------- positions

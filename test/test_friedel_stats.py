@@ -76,6 +76,23 @@ class TestPositions(unittest.TestCase):
             self.assertLess(np.abs(tfit - t).max(), 20.)
 
 
+class TestLines(unittest.TestCase):
+    def test_lines_cross_at_the_grain(self):
+        rng = np.random.RandomState(4)
+        for wedge in (0.0, 0.35):
+            pars = dict(wedge=wedge, chi=0.0, omegasign=1.0, wavelength=0.25)
+            t = rng.uniform(-500, 500, 3)
+            x1, o1, x2, o2, g = pairs_for_grain(t, pars, 10, rng)
+            p, _, _, _, v = friedel_stats._pair_solve(x1, o1, x2, o2, pars)
+            # every pair's line passes through t
+            dp = t - p
+            off = dp - (dp * v).sum(axis=1)[:, None] * v
+            self.assertLess(np.abs(off).max(), 0.1)   # um
+            d, sin, T = friedel_stats._crossing(p[:-1], v[:-1], p[1:], v[1:])
+            ok = sin > 0.05
+            self.assertLess(np.abs(T[ok] - t).max(), 2.0)
+
+
 class TestRingWindows(unittest.TestCase):
     def test_width_and_offset(self):
         rng = np.random.RandomState(3)
