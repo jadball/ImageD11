@@ -728,6 +728,20 @@ class LineIndexer(object):
                          self._bstart, self._rho, self._nrm, self._half, out)
         return out
 
+    def purity(self, ring_pairs, hkl_tol, nsample=5000):
+        """ for each ring pair: the fraction of nsample of its trials that
+        score above the best of nsample trials from scrambled peaks (an
+        estimate of how many of its trials are grains; 0 for no trials) """
+        out = []
+        for r1, r2 in ring_pairs:
+            s = []
+            for scrambled in (False, True):
+                a, b, d, sin, T = self._trials(r1, r2, scrambled)
+                k = self.rng.choice(len(a), min(nsample, len(a)), replace=False)
+                s.append(self._scores(scrambled, a[k], b[k], r1, r2, T[k], hkl_tol))
+            out.append((s[0] > s[1].max()).mean() if len(s[0]) and len(s[1]) else 0.0)
+        return np.array(out)
+
     def run(self, r1, r2, hkl_tol):
         """ index on rings r1, r2; returns (minpks, trials, new grains) """
         if self.line_tol is None:
