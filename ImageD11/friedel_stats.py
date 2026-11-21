@@ -29,11 +29,12 @@ t, a pair satisfies g_s1(t) + g_s2(t) = 0 at the grain's t. So
 
 from __future__ import print_function, division
 
+import numba
 import numpy as np
 import scipy.ndimage
 import scipy.spatial
 from scipy.special import erfinv
-from ImageD11 import cImageD11, transform
+from ImageD11 import transform
 
 # (omega, eta, tth, log10 I); omega and eta are periodic
 _PERIODIC = np.array([True, True, False, False])
@@ -482,19 +483,79 @@ def _turn_z(g, rng):
     return np.column_stack([c * g[:, 0] - s * g[:, 1], s * g[:, 0] + c * g[:, 1], g[:, 2]])
 
 
-def _angle_matches(g, I1, I2, coses, tol, chunk=2000):
-    """ (i, j), i in I1, j in I2, whose angle matches one of coses within tol """
-    n = g / np.sqrt((g * g).sum(axis=1))[:, None]
-    A, B = [], []
-    for s in range(0, len(I1), chunk):
-        c = n[I1[s:s + chunk]].dot(n[I2].T)
-        m = np.zeros(c.shape, bool)
+@numba.njit(cache=True)
+def _trial_row(i, n, X, I2, coses, ctol, dmax, smin, fill, A, B, D, S, k):
+    """ trials (i, j), j in I2: n[i].n[j] within ctol of one of coses, the
+    lines X[i], X[j] (t0, v; same rows as n) within dmax and the sine of their
+    angle above smin; as _crossing. Counts them, and stores them from k if fill """
+    m = 0
+    for j in I2:
+        if j == i:
+            continue
+        c = n[i, 0] * n[j, 0] + n[i, 1] * n[j, 1] + n[i, 2] * n[j, 2]
+        hit = False
         for x in coses:
-            m |= np.abs(c - x) < tol
-        i, j = np.nonzero(m)
-        A.append(I1[s:s + chunk][i])
-        B.append(I2[j])
-    return np.concatenate(A), np.concatenate(B)
+            if abs(c - x) < ctol:
+                hit = True
+                break
+        if not hit:
+            continue
+        w0 = X[i, 0] - X[j, 0]
+        w1 = X[i, 1] - X[j, 1]
+        w2 = X[i, 2] - X[j, 2]
+        bb = X[i, 3] * X[j, 3] + X[i, 4] * X[j, 4] + X[i, 5] * X[j, 5]
+        d1 = X[i, 3] * w0 + X[i, 4] * w1 + X[i, 5] * w2
+        d2 = X[j, 3] * w0 + X[j, 4] * w1 + X[j, 5] * w2
+        den = max(1 - bb * bb, 1e-12)
+        sn = np.sqrt(den)
+        if sn <= smin:
+            continue
+        s = (bb * d2 - d1) / den
+        u = (d2 - bb * d1) / den
+        q0 = (X[i, 0] + s * X[i, 3]) - (X[j, 0] + u * X[j, 3])
+        q1 = (X[i, 1] + s * X[i, 4]) - (X[j, 1] + u * X[j, 4])
+        q2 = (X[i, 2] + s * X[i, 5]) - (X[j, 2] + u * X[j, 5])
+        d = np.sqrt(q0 * q0 + q1 * q1 + q2 * q2)
+        if d >= dmax:
+            continue
+        if fill:
+            A[k + m] = i
+            B[k + m] = j
+            D[k + m] = d
+            S[k + m] = sn
+        m += 1
+    return m
+
+
+@numba.njit(parallel=True, cache=True)
+def _trial_count(n, X, I1, I2, coses, ctol, dmax, smin, counts):
+    e = np.zeros(0, np.int64)
+    f = np.zeros(0)
+    for r in numba.prange(len(I1)):
+        counts[r] = _trial_row(I1[r], n, X, I2, coses, ctol, dmax, smin, False, e, e, f, f, 0)
+
+
+@numba.njit(parallel=True, cache=True)
+def _trial_fill(n, X, I1, I2, coses, ctol, dmax, smin, start, A, B, D, S):
+    for r in numba.prange(len(I1)):
+        _trial_row(I1[r], n, X, I2, coses, ctol, dmax, smin, True, A, B, D, S, start[r])
+
+
+def _line_trials(n, X, I1, I2, coses, ctol, dmax, smin):
+    """ rows (a in I1, b in I2) of unit g-vectors n whose angle matches one of
+    coses within ctol and whose lines X (t0, v per row) cross within dmax at a
+    sine above smin; returns a, b, distance, sine """
+    I1 = np.ascontiguousarray(I1, np.int64)
+    I2 = np.ascontiguousarray(I2, np.int64)
+    coses = np.asarray(coses, float)
+    counts = np.zeros(len(I1), np.int64)
+    _trial_count(n, X, I1, I2, coses, ctol, dmax, smin, counts)
+    start = np.concatenate(([0], np.cumsum(counts)[:-1])).astype(np.int64)
+    N = int(counts.sum())
+    A, B = np.empty(N, np.int64), np.empty(N, np.int64)
+    D, S = np.empty(N), np.empty(N)
+    _trial_fill(n, X, I1, I2, coses, ctol, dmax, smin, start, A, B, D, S)
+    return A, B, D, S
 
 
 def _crossing(p1, v1, p2, v2):
@@ -509,18 +570,22 @@ def _crossing(p1, v1, p2, v2):
     return np.sqrt(((q1 - q2) ** 2).sum(axis=1)), np.sqrt(den), 0.5 * (q1 + q2)
 
 
-def _half_normal_on(d, dn, w, niter=300):
-    """ d on [0, w) as (1 - f) half-normal(sigma) + f (density of dn): sigma """
-    d, dn = d[d < w], dn[dn < w]
+def _half_normal_on(d, dn, w, niter=300, nfine=2000):
+    """ d on [0, w) as (1 - f) half-normal(sigma) + f (density of dn): sigma.
+    Fitted on a histogram of d with nfine bins. """
     edges = np.linspace(0, w, 81)
-    hb = np.histogram(dn, edges, density=True)[0]
-    bg = hb[np.clip(np.searchsorted(edges, d) - 1, 0, len(hb) - 1)]
+    hb = np.histogram(dn[dn < w], edges, density=True)[0]
+    fine = np.linspace(0, w, nfine + 1)
+    cnt = np.histogram(d[d < w], fine)[0].astype(float)
+    x = 0.5 * (fine[1:] + fine[:-1])
+    x, cnt = x[cnt > 0], cnt[cnt > 0]
+    bg = hb[np.clip(np.searchsorted(edges, x) - 1, 0, len(hb) - 1)]
     s, f = w / 10.0, 0.5
     for _ in range(niter):
-        g = (1 - f) * 2 * np.exp(-0.5 * (d / s) ** 2) / (s * np.sqrt(2 * np.pi))
-        p = g / (g + f * bg)
-        f = 1 - p.mean()
-        s = np.sqrt((p * d * d).sum() / p.sum())
+        g = (1 - f) * 2 * np.exp(-0.5 * (x / s) ** 2) / (s * np.sqrt(2 * np.pi))
+        p = cnt * g / (g + f * bg)
+        f = 1 - p.sum() / cnt.sum()
+        s = np.sqrt((p * x * x).sum() / p.sum())
     return s
 
 
@@ -552,44 +617,63 @@ class LineIndexer(object):
         self.keep = keep
         self.pair = cfp['pair'].astype(int)
         self.t, self.v = t, v
+        self._X = np.ascontiguousarray(np.hstack((t, v)), float)
+        self._Xrow = self._X[self.pair]   # the line of each row
         g = np.column_stack([cfp.gx, cfp.gy, cfp.gz])
         ringds = np.asarray(ucell.ringds)
         self.ra = np.argmin(np.abs(cfp.ds[:, None] - ringds[None, :]), axis=1)
         self.ra[np.abs(cfp.ds - ringds[self.ra]) >= dstol] = -1
         self.S = np.flatnonzero(np.isin(self.ra, _ring_numbers(ringds, score_ds)))
         self.g = {False: np.ascontiguousarray(g), True: np.ascontiguousarray(_turn_z(g, np.random.RandomState(seed)))}
-        self.gS = {k: np.ascontiguousarray(x[self.S]) for k, x in self.g.items()}
+        self.n = {k: np.ascontiguousarray(x / np.sqrt((x * x).sum(axis=1))[:, None]) for k, x in self.g.items()}
+        self._cache = {}
         self.first = np.arange(len(g)) < len(g) // 2   # one row per pair (the other is -g)
         self.claimed = np.zeros(len(t), bool)
         self.rng = np.random.RandomState(seed)
         self.line_tol = None
         self.ubis, self.positions, self.npairs = [], [], []
         self.pair_grain = np.full(len(t), -1)
-        self._drlv2 = np.empty(len(self.S))
-        self._lab = np.empty(len(self.S), np.int32)
         r = np.sqrt((t[:, :2] ** 2).sum(axis=1))
         self.radius = np.percentile(r, 100 * keep)
 
-    def _trials(self, r1, r2, scrambled):
-        coses = self.ucell.getcoses(r1, r2)
-        free = self.first & ~self.claimed[self.pair]
-        I1 = np.flatnonzero(free & (self.ra == r1))
-        I2 = np.flatnonzero(free & (self.ra == r2))
-        if len(coses) == 0 or len(I1) == 0 or len(I2) == 0:
-            return np.zeros(0, int), np.zeros(0, int), np.zeros(0), np.zeros(0), np.zeros((0, 3))
-        a, b = _angle_matches(self.g[scrambled], I1, I2, coses, self.cosine_tol)
-        k = self.pair[a] != self.pair[b]
-        a, b = a[k], b[k]
+    def _trials(self, r1, r2, scrambled, dmax=None, smin=None):
+        """ trials of rings r1, r2 (one row per pair, pairs unclaimed):
+        a, b, distance and sine of the crossing of their lines, crossing point.
+        Default dmax, smin: line_tol, line_tol / radius (cached, as claims only
+        remove trials) """
+        if dmax is None:
+            dmax, smin = self.line_tol, self.line_tol / self.radius
+        key = (r1, r2, scrambled, dmax, smin)
+        if key not in self._cache:
+            coses = self.ucell.getcoses(r1, r2)
+            free = self.first & ~self.claimed[self.pair]
+            I1 = np.flatnonzero(free & (self.ra == r1))
+            I2 = np.flatnonzero(free & (self.ra == r2))
+            if len(coses) == 0 or len(I1) == 0 or len(I2) == 0:
+                self._cache[key] = (np.zeros(0, int), np.zeros(0, int), np.zeros(0), np.zeros(0))
+            else:
+                self._cache[key] = _line_trials(self.n[scrambled], self._Xrow, I1, I2, coses, self.cosine_tol, dmax, smin)
+        a, b, d, sin = self._cache[key]
+        k = ~(self.claimed[self.pair[a]] | self.claimed[self.pair[b]])
+        a, b, d, sin = a[k], b[k], d[k], sin[k]
         pa, pb = self.pair[a], self.pair[b]
-        d, sin, T = _crossing(self.t[pa], self.v[pa], self.t[pb], self.v[pb])
+        T = _crossing(self.t[pa], self.v[pa], self.t[pb], self.v[pb])[2]
         return a, b, d, sin, T
 
     def measure_line_tol(self, ring_pairs):
         """ line_tol from the trials of all ring_pairs ((r1, r2), ...);
         returns the spread (sigma) and line_tol """
-        d = np.concatenate([self._trials(r1, r2, False)[2] for r1, r2 in ring_pairs])
-        dn = np.concatenate([self._trials(r1, r2, True)[2] for r1, r2 in ring_pairs])
         w = 2 * self.radius
+        d, dn = [], []
+        free = self.first & ~self.claimed[self.pair]
+        for r1, r2 in ring_pairs:
+            coses = self.ucell.getcoses(r1, r2)
+            I1 = np.flatnonzero(free & (self.ra == r1))
+            I2 = np.flatnonzero(free & (self.ra == r2))
+            if len(coses) and len(I1) and len(I2):
+                for x, scrambled in ((d, False), (dn, True)):
+                    x.append(_line_trials(self.n[scrambled], self._Xrow, I1, I2, coses, self.cosine_tol, w, -1.0)[2])
+        d, dn = np.concatenate(d), np.concatenate(dn)
         sigma = _half_normal_on(d, dn, w)
         self.line_d, self.line_dn = d, dn
         # half-normal: the fraction keep lies within sigma * sqrt(2) * erfinv(keep)
@@ -597,51 +681,172 @@ class LineIndexer(object):
         self.line_sigma = sigma
         return sigma, self.line_tol
 
-    def _matched(self, scrambled, a, b, r1, r2, T, hkl_tol):
+    def _ok(self):
+        """ per pair: on a scoring ring and not claimed """
+        ok = np.zeros(len(self.t), bool)
+        ok[self.pair[self.S]] = True
+        return ok & ~self.claimed
+
+    def _orient(self, scrambled, a, b, r1, r2):
+        """ unitcell.orient for many trials at once (the hkl pair whose
+        angle is nearest, as orient with crange < 0) """
         g = self.g[scrambled]
-        self.ucell.orient(r1, g[a], r2, g[b], verbose=0)
-        ubi = self.ucell.UBI.copy()
-        self._drlv2.fill(1.0)
-        self._lab.fill(-1)
-        cImageD11.score_and_assign(ubi, self.gS[scrambled], hkl_tol, self._drlv2, self._lab, 0)
-        p = np.unique(self.pair[self.S[self._lab == 0]])
-        p = p[~self.claimed[p]]
-        dp = self.t[p] - T
-        vv = self.v[p]
-        dist = np.sqrt(((dp - (dp * vv).sum(axis=1)[:, None] * vv) ** 2).sum(axis=1))
-        return ubi, p[dist < self.line_tol]
+        hab, c2ab, matrs = self.ucell.getanglehkls(r1, r2)
+        c2ab = np.asarray(c2ab)
+        g1, g2 = g[a], g[b]
+        cos = (g1 * g2).sum(axis=1) / np.sqrt((g1 * g1).sum(axis=1) * (g2 * g2).sum(axis=1))
+        i = np.searchsorted(c2ab, cos, side='left')
+        lo = np.clip(i - 1, 0, len(c2ab) - 1)
+        hi = np.clip(i, 0, len(c2ab) - 1)
+        best = np.where((i > 0) & ((i == len(c2ab)) | (np.abs(cos - c2ab[lo]) < np.abs(cos - c2ab[hi]))), lo, hi)
+        u0 = g1 / np.sqrt((g1 * g1).sum(axis=1))[:, None]
+        u2 = np.cross(g1, g2)
+        u2 /= np.sqrt((u2 * u2).sum(axis=1))[:, None]
+        M = np.stack((u0, np.cross(u0, u2), u2), axis=1)
+        return np.ascontiguousarray(np.matmul(np.asarray(matrs)[best], M))
+
+    def _index(self):
+        """ lines sorted for _line_hits (rebuilt when line_tol changes): bins
+        narrow enough that a point within radius moves by line_tol / 4 """
+        if getattr(self, '_index_tol', None) != self.line_tol:
+            nbins = max(1, int(np.ceil(np.pi * 2 * self.radius / (0.5 * self.line_tol))))
+            order, self._bstart, self._rho, self._nrm, self._half = _line_index(self.t, self.v, nbins)
+            npairs = len(self.t)
+            self._order = order
+            self._Xs = np.ascontiguousarray(self._X[order])
+            self._gs = {k: np.ascontiguousarray(np.concatenate((x[order], x[order + npairs])))
+                        for k, x in self.g.items()}
+            self._index_tol = self.line_tol
 
     def _scores(self, scrambled, a, b, r1, r2, T, hkl_tol):
-        return np.array([len(self._matched(scrambled, a[k], b[k], r1, r2, T[k], hkl_tol)[1]) for k in range(len(a))], int)
+        ubis = self._orient(scrambled, a, b, r1, r2)
+        out = np.zeros(len(a), np.int64)
+        if len(a):
+            self._index()
+            _line_scores(ubis, np.ascontiguousarray(T, float), self._Xs, self._gs[scrambled], self._ok()[self._order],
+                         2 if scrambled else 1, float(self.line_tol), float(hkl_tol),
+                         self._bstart, self._rho, self._nrm, self._half, out)
+        return out
 
     def run(self, r1, r2, hkl_tol):
         """ index on rings r1, r2; returns (minpks, trials, new grains) """
         if self.line_tol is None:
             self.measure_line_tol([(r1, r2)])
-        sin_min = self.line_tol / self.radius
         a, b, d, sin, T = self._trials(r1, r2, False)
-        k = (d < self.line_tol) & (sin > sin_min)
-        a, b, T = a[k], b[k], T[k]
         an, bn, dn, sinn, Tn = self._trials(r1, r2, True)
-        kn = np.flatnonzero((dn < self.line_tol) & (sinn > sin_min))
+        kn = np.arange(len(an))
         kn = self.rng.choice(kn, min(len(kn), len(a)), replace=False) if len(kn) else kn
         sn = self._scores(True, an[kn], bn[kn], r1, r2, Tn[kn], hkl_tol)
         minpks = int(sn.max()) if len(sn) else 0
         s = self._scores(False, a, b, r1, r2, T, hkl_tol)
         n0 = len(self.ubis)
+        self._index()
+        ok = self._ok()[self._order]
+        m = np.zeros(len(self.t), np.uint8)
+        ht2 = float(hkl_tol) ** 2
         for k in np.argsort(-s, kind='stable'):
             if s[k] <= minpks:
                 break
             if self.claimed[self.pair[a[k]]] or self.claimed[self.pair[b[k]]]:
                 continue
-            ubi, p = self._matched(False, a[k], b[k], r1, r2, T[k], hkl_tol)
-            if len(p) > minpks:
+            ubi = self._orient(False, a[k:k + 1], b[k:k + 1], r1, r2)[0]
+            m[:] = 0
+            _line_hits(ubi, T[k].astype(float), self._Xs, self._gs[False], ok, 1, float(self.line_tol), ht2,
+                       self._bstart, self._rho, self._nrm, self._half, m)
+            q = np.flatnonzero(m)
+            if len(q) > minpks:
+                p = self._order[q]
+                ok[q] = False
                 self.claimed[p] = True
                 self.pair_grain[p] = len(self.ubis)
                 self.ubis.append(ubi)
                 self.positions.append(T[k])
                 self.npairs.append(len(p))
         return minpks, len(a), len(self.ubis) - n0
+
+
+def _line_index(t, v, nbins):
+    """ lines t + s v sorted for _line_hits: binned by the direction of their
+    xy projection (nbins over 180 deg), sorted within a bin by their signed
+    xy distance rho from the rotation axis; lines within 30 deg of vertical in
+    a last bin. Returns order, bin starts, rho (sorted), bin centre normals,
+    half bin width (radians). """
+    vxy = np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2)
+    phi = np.arctan2(v[:, 1], v[:, 0]) % np.pi
+    rho = -np.sin(phi) * t[:, 0] + np.cos(phi) * t[:, 1]
+    b = np.minimum((phi / np.pi * nbins).astype(int), nbins - 1)
+    b[vxy < 0.5] = nbins
+    order = np.lexsort((rho, b))
+    bstart = np.searchsorted(b[order], np.arange(nbins + 2)).astype(np.int64)
+    c = (np.arange(nbins) + 0.5) * np.pi / nbins
+    nrm = np.ascontiguousarray(np.column_stack((-np.sin(c), np.cos(c))))
+    return order, bstart, np.ascontiguousarray(rho[order]), nrm, 0.5 * np.pi / nbins
+
+
+@numba.njit(cache=True)
+def _hit(p, Tx, Ty, Tz, u, X, g, ok, rows, npairs, lt2, ht2):
+    d0 = Tx - X[p, 0]
+    d1 = Ty - X[p, 1]
+    d2 = Tz - X[p, 2]
+    s = d0 * X[p, 3] + d1 * X[p, 4] + d2 * X[p, 5]
+    if d0 * d0 + d1 * d1 + d2 * d2 - s * s >= lt2 or not ok[p]:
+        return False
+    for r in range(rows):
+        q = p + r * npairs
+        gx, gy, gz = g[q, 0], g[q, 1], g[q, 2]
+        h = u[0] * gx + u[1] * gy + u[2] * gz
+        h -= np.rint(h)
+        e2 = h * h
+        if e2 >= ht2:
+            continue
+        h = u[3] * gx + u[4] * gy + u[5] * gz
+        h -= np.rint(h)
+        e2 += h * h
+        if e2 >= ht2:
+            continue
+        h = u[6] * gx + u[7] * gy + u[8] * gz
+        h -= np.rint(h)
+        if e2 + h * h < ht2:
+            return True
+    return False
+
+
+@numba.njit(cache=True)
+def _line_hits(ubi, T, X, g, ok, rows, line_tol, ht2, bstart, rho, nrm, half, out):
+    """ the pairs p (ok) whose line X[p] = (t0, v) passes within line_tol of
+    T and whose g (rows p, p + npairs, ... up to rows) indexes with ubi (hkl
+    error^2 < ht2): returns their count, and sets out[p] = 1 for them if out
+    is not empty. X, g, ok, rho in the order of _line_index; only lines whose
+    xy projection can pass within line_tol of T are tested. """
+    u = ubi.ravel()
+    Tx, Ty, Tz = T[0], T[1], T[2]
+    npairs = X.shape[0]
+    lt2 = line_tol * line_tol
+    w = line_tol * (1 + 1e-9) + np.sqrt(Tx * Tx + Ty * Ty) * half
+    mark = len(out) > 0
+    nb = len(nrm)
+    n = 0
+    for k in range(nb + 1):
+        lo, hi = bstart[k], bstart[k + 1]
+        if k < nb:
+            c = Tx * nrm[k, 0] + Ty * nrm[k, 1]
+            r = rho[lo:hi]
+            lo, hi = lo + np.searchsorted(r, c - w), lo + np.searchsorted(r, c + w)
+        for p in range(lo, hi):
+            if _hit(p, Tx, Ty, Tz, u, X, g, ok, rows, npairs, lt2, ht2):
+                if mark:
+                    out[p] = 1
+                n += 1
+    return n
+
+
+@numba.njit(parallel=True, cache=True)
+def _line_scores(ubis, T, X, g, ok, rows, line_tol, hkl_tol, bstart, rho, nrm, half, out):
+    """ out[i]: the count of _line_hits for trial i """
+    ht2 = hkl_tol * hkl_tol
+    none = np.zeros(0, np.uint8)
+    for i in numba.prange(len(ubis)):
+        out[i] = _line_hits(np.ascontiguousarray(ubis[i]), T[i], X, g, ok, rows, line_tol, ht2, bstart, rho, nrm, half, none)
 
 
 # ---------------------------------------------------------------- positions
