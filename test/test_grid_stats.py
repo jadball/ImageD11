@@ -56,6 +56,20 @@ class TestRefineGrains(unittest.TestCase):
         self.assertEqual(len(out), len(self.grains) - 1)
         self.assertTrue((self.cf.labels >= 0).sum() > 0)
 
+    def test_exact_matches_serial(self):
+        # refined in parallel chunks after one global assignment: as refine_grains
+        cf2 = self.cf.copy()
+        out, kept = grid_stats.refine_grains(self.prm, self.cf, self.grains, 0.02, 0.25, 'cubic')
+        out2, kept2 = grid_stats.refine_grains_exact(self.prm, cf2, self.grains, 0.02, 0.25, 'cubic', 2)
+        self.assertEqual(kept, kept2)
+        for a, b in zip(out, out2):
+            self.assertTrue(np.array_equal(a.ubi, b.ubi))
+            self.assertTrue(np.array_equal(a.translation, b.translation))
+            self.assertEqual((a.npks, a.nuniq, a.intensity_info), (b.npks, b.nuniq, b.intensity_info))
+        self.assertEqual(sorted(self.cf.titles), sorted(cf2.titles))
+        for t in self.cf.titles:
+            self.assertTrue(np.array_equal(self.cf[t], cf2[t]), t)
+
 
 if __name__ == '__main__':
     unittest.main()

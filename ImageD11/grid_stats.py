@@ -294,6 +294,53 @@ class _RefineDropFailed(refinegrains):
         self.tolerance = tolcache
 
 
+def _makemap_columns_ready(colfile):
+    """ the columns refinegrains.loadfiltered adds """
+    if 'drlv2' not in colfile.titles:
+        colfile.addcolumn(np.ones(colfile.nrows), 'drlv2')
+    if 'labels' not in colfile.titles:
+        colfile.addcolumn(np.full(colfile.nrows, -1.), 'labels')
+    if 'sc' not in colfile.titles:
+        colfile.addcolumn(colfile.xc.copy(), 'sc')
+    if 'fc' not in colfile.titles:
+        colfile.addcolumn(colfile.yc.copy(), 'fc')
+
+
+def _refiner(parfile, colfile, grains, kept, tol, omega_slop, symmetry):
+    """ a _RefineDropFailed on colfile with grains[i] for i in kept (named i),
+    orientations made unique, labels reset """
+    o = _RefineDropFailed(tolerance=tol, intensity_tth_range=(0, 180),
+                          OmFloat=omega_slop > 0, OmSlop=omega_slop)
+    o.loadparameters(parfile)
+    o.scannames = ['internal']
+    o.scantitles = colfile.titles
+    o.scandata['internal'] = colfile
+    for i in kept:
+        o.grainnames.append(i)
+        o.ubisread[i] = grains[i].ubi
+        o.translationsread[i] = grains[i].translation
+    if symmetry != 'triclinic':
+        o.makeuniq(symmetry)
+    o.generate_grains()
+    return o
+
+
+def _refine_once(parfile, colfile, grains, kept, tol, omega_slop, symmetry, save_columns):
+    """ one makemap pass (assign, fit positions and UBIs); returns the
+    refinegrains object, with o.failed the grains whose fit failed """
+    ss = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        o = _refiner(parfile, colfile, grains, kept, tol, omega_slop, symmetry)
+        o.refinepositions()
+        if not o.failed and save_columns:
+            o.update_columns(sort_npks=False)
+    finally:
+        sys.stdout.close()
+        sys.stdout = ss
+    return o
+
+
 def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry, save_columns=True):
     """
     makemap.py in a function: refine the positions and UBIs of grains against
@@ -303,39 +350,10 @@ def refine_grains(parfile, colfile, grains, tol, omega_slop, symmetry, save_colu
     save_columns h, k, l, gx, ...).
     Returns (refined grains, indices into grains of those kept).
     """
-    # columns refinegrains.loadfiltered adds
-    if 'drlv2' not in colfile.titles:
-        colfile.addcolumn(np.ones(colfile.nrows), 'drlv2')
-    if 'labels' not in colfile.titles:
-        colfile.addcolumn(np.full(colfile.nrows, -1.), 'labels')
-    if 'sc' not in colfile.titles:
-        colfile.addcolumn(colfile.xc.copy(), 'sc')
-    if 'fc' not in colfile.titles:
-        colfile.addcolumn(colfile.yc.copy(), 'fc')
+    _makemap_columns_ready(colfile)
     kept = list(range(len(grains)))
-    ss = sys.stdout
     while True:
-        sys.stdout = open(os.devnull, 'w')
-        try:
-            o = _RefineDropFailed(tolerance=tol, intensity_tth_range=(0, 180),
-                                  OmFloat=omega_slop > 0, OmSlop=omega_slop)
-            o.loadparameters(parfile)
-            o.scannames = ['internal']
-            o.scantitles = colfile.titles
-            o.scandata['internal'] = colfile
-            for i in kept:
-                o.grainnames.append(i)
-                o.ubisread[i] = grains[i].ubi
-                o.translationsread[i] = grains[i].translation
-            if symmetry != 'triclinic':
-                o.makeuniq(symmetry)
-            o.generate_grains()
-            o.refinepositions()
-            if not o.failed and save_columns:
-                o.savegrains(os.devnull, sort_npks=False)
-        finally:
-            sys.stdout.close()
-            sys.stdout = ss
+        o = _refine_once(parfile, colfile, grains, kept, tol, omega_slop, symmetry, save_columns)
         if not o.failed:
             return [o.grains[(i, 'internal')] for i in kept], kept
         print('%d grains dropped: refinement failed (left handed UBI)' % len(o.failed))
@@ -390,4 +408,79 @@ def refine_grains_parallel(parfile, colfile, grains, tol, omega_slop, symmetry, 
             g.npks, g.intensity_info = npks, info
             out.append(g)
             kept.append(s + i)
+    return out, kept
+
+
+def _refine_rows_job(job):
+    """ refine grains (named 0, 1, ...) on the rows of the peaks assigned to
+    them; returns the grains, the failed ones and the makemap columns of
+    those rows """
+    ubis_translations, rows = job
+    colfile, parfile, tol, omega_slop, symmetry = _G['refine']
+    sub = colfile.copyrows(rows)
+    grains = [grain.grain(u, t) for u, t in ubis_translations]
+    _makemap_columns_ready(sub)
+    o = _refine_once(parfile, sub, grains, list(range(len(grains))), tol, omega_slop, symmetry, True)
+    if o.failed:
+        return None, o.failed, None
+    out = [o.grains[(i, 'internal')] for i in range(len(grains))]
+    cols = dict((t, np.asarray(sub[t])) for t in _MAKEMAP_COLUMNS + ('gx', 'gy', 'gz') if t in sub.titles)
+    return [(g.ubi, np.array(g.translation), g.npks, g.intensity_info, g.nuniq) for g in out], [], cols
+
+
+def refine_grains_exact(parfile, colfile, grains, tol, omega_slop, symmetry, nproc):
+    """
+    refine_grains (with save_columns) in parallel, with the same result:
+    peaks are assigned among all grains first (as refine_grains), then the
+    grains are refined in chunks on the peaks assigned to them, which no other
+    grain can take. A grain whose fit fails is dropped and all is done again.
+    colfile gets the makemap columns. Returns (refined grains, indices into
+    grains of those kept).
+    """
+    _makemap_columns_ready(colfile)
+    path = _save_arrays(dict((t, colfile[t]) for t in colfile.titles if t not in _MAKEMAP_COLUMNS))
+    p = _pool(nproc, _refine_init, (path, (os.path.abspath(parfile), tol, omega_slop, symmetry)))
+    try:
+        kept = list(range(len(grains)))
+        while True:
+            ss = sys.stdout
+            sys.stdout = open(os.devnull, 'w')
+            try:
+                o = _refiner(parfile, colfile, grains, kept, tol, omega_slop, symmetry)
+                o.assignlabels()   # all grains: fills labels and the columns of unassigned peaks
+            finally:
+                sys.stdout.close()
+                sys.stdout = ss
+            labels = np.asarray(colfile['labels'])
+            order = np.argsort(labels, kind='stable')
+            sl = labels[order]
+            chunk = max(1, len(kept) // (4 * nproc))
+            parts = [kept[s:s + chunk] for s in range(0, len(kept), chunk)]
+            jobs = []
+            for part in parts:
+                rows = np.concatenate([order[np.searchsorted(sl, i, 'left'):np.searchsorted(sl, i, 'right')]
+                                       for i in part])
+                jobs.append(([(grains[i].ubi, np.asarray(grains[i].translation, float)) for i in part], np.sort(rows)))
+            res = p.map(_refine_rows_job, jobs, chunksize=1)
+            failed = set(part[j] for part, (_, f, _) in zip(parts, res) for j in f)
+            if not failed:
+                break
+            print('%d grains dropped: refinement failed (left handed UBI)' % len(failed))
+            kept = [i for i in kept if i not in failed]
+    finally:
+        p.close()
+        p.join()
+        shutil.rmtree(path)
+    out = []
+    for part, (gl, _, cols), (_, rows) in zip(parts, res, jobs):
+        for i, (u, t, npks, info, nuniq) in zip(part, gl):
+            g = grain.grain(u, t)
+            g.npks, g.intensity_info, g.nuniq = npks, info, nuniq
+            out.append(g)
+        for t, v in cols.items():
+            if t == 'labels':   # the chunk's grains are named 0, 1, ... there
+                v = np.asarray(part)[v.astype(int)]
+            col = np.array(colfile[t])
+            col[rows] = v
+            colfile.addcolumn(col, t)
     return out, kept
